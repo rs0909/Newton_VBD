@@ -28,7 +28,7 @@ import numpy as np
 import warp as wp
 from warp.types import float32, matrix
 
-from newton._src.solvers.vbd.rigid_vbd_kernels import evaluate_body_particle_contact
+from newton._src.solvers.vbd.rigid_vbd_kernels import evaluate_body_particle_contact, evaluate_body_particle_contact_log_collision
 
 from ...geometry import ParticleFlags
 from ...geometry.kernels import triangle_closest_point
@@ -977,6 +977,196 @@ def evaluate_edge_edge_contact_2_vertices(
 
         return False, collision_force, collision_force, collision_hessian, collision_hessian
 
+@wp.func
+def evaluate_edge_edge_contact_2_vertices_log_collision(
+    e1: int,
+    e2: int,
+    pos: wp.array(dtype=wp.vec3),
+    pos_anchor: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_radius: float,
+    collision_stiffness: float,
+    collision_damping: float,
+    friction_coefficient: float,
+    friction_epsilon: float,
+    dt: float,
+    edge_edge_parallel_epsilon: float,
+):
+    r"""
+    Returns the edge-edge contact force and hessian, including the friction force.
+    Args:
+        v:
+        v_order: \in {0, 1, 2, 3}, 0, 1 is vertex 0, 1 of e1, 2,3 is vertex 0, 1 of e2
+        e0
+        e1
+        pos
+        edge_indices
+        collision_radius
+        collision_stiffness
+        dt
+    """
+    e1_v1 = edge_indices[e1, 2]
+    e1_v2 = edge_indices[e1, 3]
+
+    e1_v1_pos = pos[e1_v1]
+    e1_v2_pos = pos[e1_v2]
+
+    e2_v1 = edge_indices[e2, 2]
+    e2_v2 = edge_indices[e2, 3]
+
+    e2_v1_pos = pos[e2_v1]
+    e2_v2_pos = pos[e2_v2]
+
+    st = wp.closest_point_edge_edge(e1_v1_pos, e1_v2_pos, e2_v1_pos, e2_v2_pos, edge_edge_parallel_epsilon)
+    s = st[0]
+    t = st[1]
+    e1_vec = e1_v2_pos - e1_v1_pos
+    e2_vec = e2_v2_pos - e2_v1_pos
+    c1 = e1_v1_pos + e1_vec * s
+    c2 = e2_v1_pos + e2_vec * t
+
+    # c1, c2, s, t = closest_point_edge_edge_2(e1_v1_pos, e1_v2_pos, e2_v1_pos, e2_v2_pos)
+
+    diff = c1 - c2
+    dis = st[2]
+    collision_normal = diff / dis
+
+    if 0.0 < dis < collision_radius:
+        bs = wp.vec4(1.0 - s, s, -1.0 + t, -t)
+
+        dEdD, d2E_dDdD = evaluate_self_contact_force_norm(dis, collision_radius, collision_stiffness)
+
+        collision_force = -dEdD * collision_normal
+        collision_hessian = d2E_dDdD * wp.outer(collision_normal, collision_normal)
+
+        # friction
+        c1_prev = pos_anchor[e1_v1] + (pos_anchor[e1_v2] - pos_anchor[e1_v1]) * s
+        c2_prev = pos_anchor[e2_v1] + (pos_anchor[e2_v2] - pos_anchor[e2_v1]) * t
+
+        dx = (c1 - c1_prev) - (c2 - c2_prev) # c2 frame 기준 relative c1 disp
+        axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+
+        T = mat32(
+            axis_1[0],
+            axis_2[0],
+            axis_1[1],
+            axis_2[1],
+            axis_1[2],
+            axis_2[2],
+        )
+
+        u = wp.transpose(T) * dx
+        eps_U = friction_epsilon * dt
+
+        # fmt: off
+        if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
+            wp.printf(
+                "    collision force:\n    %f %f %f,\n    collision hessian:\n    %f %f %f,\n    %f %f %f,\n    %f %f %f\n",
+                collision_force[0], collision_force[1], collision_force[2], collision_hessian[0, 0], collision_hessian[0, 1], collision_hessian[0, 2], collision_hessian[1, 0], collision_hessian[1, 1], collision_hessian[1, 2], collision_hessian[2, 0], collision_hessian[2, 1], collision_hessian[2, 2],
+            )
+        # fmt: on
+
+        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+
+        # # fmt: off
+        # if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
+        #     wp.printf(
+        #         "    friction force:\n    %f %f %f,\n    friction hessian:\n    %f %f %f,\n    %f %f %f,\n    %f %f %f\n",
+        #         friction_force[0], friction_force[1], friction_force[2], friction_hessian[0, 0], friction_hessian[0, 1], friction_hessian[0, 2], friction_hessian[1, 0], friction_hessian[1, 1], friction_hessian[1, 2], friction_hessian[2, 0], friction_hessian[2, 1], friction_hessian[2, 2],
+        #     )
+        # # fmt: on
+
+        displacement_0 = pos_anchor[e1_v1] - e1_v1_pos
+        displacement_1 = pos_anchor[e1_v2] - e1_v2_pos
+
+        collision_force_0 = collision_force * bs[0] # e1 v1
+        collision_force_1 = collision_force * bs[1] # e1 v2
+        contacts_normal_contact_force0 = collision_force_0
+        contacts_normal_contact_force1 = collision_force_1
+
+        collision_hessian_0 = collision_hessian * bs[0] * bs[0]
+        collision_hessian_1 = collision_hessian * bs[1] * bs[1]
+
+        collision_normal_sign = wp.vec4(1.0, 1.0, -1.0, -1.0)
+        damping_force, damping_hessian = damp_collision(
+            displacement_0,
+            collision_normal * collision_normal_sign[0],
+            collision_hessian_0,
+            collision_damping,
+            dt,
+        )
+        ncfs = damping_force # normal contact force sum
+        ncfm = damping_force # normal contact force min
+
+
+        collision_force_0 += damping_force + bs[0] * friction_force
+        collision_hessian_0 += damping_hessian + bs[0] * bs[0] * friction_hessian
+
+        contacts_friction0 = bs[0] * friction_force
+
+        damping_force, damping_hessian = damp_collision(
+            displacement_1,
+            collision_normal * collision_normal_sign[1],
+            collision_hessian_1,
+            collision_damping,
+            dt,
+        )
+        ncfs += damping_force
+        if wp.length(damping_force) < wp.length(ncfm):
+            ncfm = damping_force
+
+        collision_force_1 += damping_force + bs[1] * friction_force
+        collision_hessian_1 += damping_hessian + bs[1] * bs[1] * friction_hessian
+
+        contacts_friction1 = bs[1] * friction_force
+
+        return (True, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1,
+        
+                T,
+                collision_normal, 
+                wp.length(u), # u_norm
+                eps_U,
+                friction_force,
+                ncfs,
+                ncfm,
+
+
+                contacts_normal_contact_force0,
+                contacts_normal_contact_force1,
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                contacts_friction0,
+                contacts_friction1,
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0)
+        )
+    else:
+        collision_force = wp.vec3(0.0, 0.0, 0.0)
+        collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        
+        T = mat32(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+        return (False, collision_force, collision_force, collision_hessian, collision_hessian,
+        
+                T,
+                collision_force, 
+                0.0, # u_norm
+                0.0,
+                collision_force,
+                collision_force,
+                collision_force,
+
+
+                collision_force,
+                collision_force,
+                collision_force,
+                collision_force,
+                collision_force,
+                collision_force,
+                collision_force,
+                collision_force,
+        )
+
 
 @wp.func
 def evaluate_vertex_triangle_collision_force_hessian(
@@ -1217,6 +1407,218 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
         )
 
 
+
+@wp.func
+def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
+    v: int,
+    tri: int,
+    pos: wp.array(dtype=wp.vec3),
+    pos_anchor: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_radius: float,
+    collision_stiffness: float,
+    collision_damping: float,
+    friction_coefficient: float,
+    friction_epsilon: float,
+    dt: float,
+):
+    a = pos[tri_indices[tri, 0]]
+    b = pos[tri_indices[tri, 1]]
+    c = pos[tri_indices[tri, 2]]
+
+    p = pos[v]
+
+    closest_p, bary, _feature_type = triangle_closest_point(a, b, c, p)
+
+    diff = p - closest_p
+    dis = wp.length(diff)
+    collision_normal = diff / dis
+
+    if 0.0 < dis < collision_radius:
+        bs = wp.vec4(-bary[0], -bary[1], -bary[2], 1.0)
+
+        dEdD, d2E_dDdD = evaluate_self_contact_force_norm(dis, collision_radius, collision_stiffness)
+
+        collision_force = -dEdD * collision_normal
+        collision_hessian = d2E_dDdD * wp.outer(collision_normal, collision_normal)
+
+        # friction force
+        dx_v = p - pos_anchor[v] # pos_anchor is prev position
+
+        closest_p_prev = (
+            bary[0] * pos_anchor[tri_indices[tri, 0]]
+            + bary[1] * pos_anchor[tri_indices[tri, 1]]
+            + bary[2] * pos_anchor[tri_indices[tri, 2]]
+        )
+
+        dx = dx_v - (closest_p - closest_p_prev) # relative dx
+
+        e0, e1 = build_orthonormal_basis(collision_normal)
+
+        T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
+
+        u = wp.transpose(T) * dx
+        u_norm = wp.length(u)
+        eps_U = friction_epsilon * dt
+
+        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+
+
+        # fmt: off
+        if wp.static("contact_force_hessian_vt" in VBD_DEBUG_PRINTING_OPTIONS):
+            wp.printf(
+                "v: %d dEdD: %f\nnormal force: %f %f %f\nfriction force: %f %f %f\n",
+                v,
+                dEdD,
+                collision_force[0], collision_force[1], collision_force[2], friction_force[0], friction_force[1],
+                friction_force[2],
+            )
+        # fmt: on
+
+        displacement_0 = pos_anchor[tri_indices[tri, 0]] - a
+        displacement_1 = pos_anchor[tri_indices[tri, 1]] - b
+        displacement_2 = pos_anchor[tri_indices[tri, 2]] - c
+        displacement_3 = pos_anchor[v] - p
+
+        collision_force_0 = collision_force * bs[0] # tri_a
+        collision_force_1 = collision_force * bs[1] # tri_b
+        collision_force_2 = collision_force * bs[2] # tri_c
+        collision_force_3 = collision_force * bs[3] # v
+
+        contacts_normal_contact_force0 = collision_force_0
+        contacts_normal_contact_force1 = collision_force_1
+        contacts_normal_contact_force2 = collision_force_2
+        contacts_normal_contact_force3 = collision_force_3
+
+        collision_hessian_0 = collision_hessian * bs[0] * bs[0]
+        collision_hessian_1 = collision_hessian * bs[1] * bs[1]
+        collision_hessian_2 = collision_hessian * bs[2] * bs[2]
+        collision_hessian_3 = collision_hessian * bs[3] * bs[3]
+
+        collision_normal_sign = wp.vec4(-1.0, -1.0, -1.0, 1.0)
+        damping_force, damping_hessian = damp_collision(
+            displacement_0,
+            collision_normal * collision_normal_sign[0],
+            collision_hessian_0,
+            collision_damping,
+            dt,
+        )
+        ncfs = damping_force
+        ncfm = damping_force
+
+        collision_force_0 += damping_force + bs[0] * friction_force
+        collision_hessian_0 += damping_hessian + bs[0] * bs[0] * friction_hessian
+
+        contacts_friction0 = bs[0] * friction_force
+
+        damping_force, damping_hessian = damp_collision(
+            displacement_1,
+            collision_normal * collision_normal_sign[1],
+            collision_hessian_1,
+            collision_damping,
+            dt,
+        )
+        ncfs += damping_force
+        if wp.length(damping_force) < wp.length(ncfm):
+            ncfm = damping_force
+
+        collision_force_1 += damping_force + bs[1] * friction_force
+        collision_hessian_1 += damping_hessian + bs[1] * bs[1] * friction_hessian
+
+        contacts_friction1 = bs[1] * friction_force
+
+        damping_force, damping_hessian = damp_collision(
+            displacement_2,
+            collision_normal * collision_normal_sign[2],
+            collision_hessian_2,
+            collision_damping,
+            dt,
+        )
+        ncfs += damping_force
+        if wp.length(damping_force) < wp.length(ncfm):
+            ncfm = damping_force
+        collision_force_2 += damping_force + bs[2] * friction_force
+        collision_hessian_2 += damping_hessian + bs[2] * bs[2] * friction_hessian
+
+        contacts_friction2 = bs[2] * friction_force
+
+        damping_force, damping_hessian = damp_collision(
+            displacement_3,
+            collision_normal * collision_normal_sign[3],
+            collision_hessian_3,
+            collision_damping,
+            dt,
+        )
+        ncfs += damping_force
+        if wp.length(damping_force) < wp.length(ncfm):
+            ncfm = damping_force
+        collision_force_3 += damping_force + bs[3] * friction_force
+        collision_hessian_3 += damping_hessian + bs[3] * bs[3] * friction_hessian
+
+        contacts_friction3 = bs[3] * friction_force
+
+        return (
+            True,
+            collision_force_0,
+            collision_force_1,
+            collision_force_2,
+            collision_force_3,
+            collision_hessian_0,
+            collision_hessian_1,
+            collision_hessian_2,
+            collision_hessian_3,
+            T,
+            collision_normal,
+            u_norm,
+            eps_U,
+            friction_force,
+            ncfs,
+            ncfm,
+
+
+            contacts_normal_contact_force0,
+            contacts_normal_contact_force1,
+            contacts_normal_contact_force2,
+            contacts_normal_contact_force3,
+            contacts_friction0,
+            contacts_friction1,
+            contacts_friction2,
+            contacts_friction3
+        )
+    else:
+        collision_force = wp.vec3(0.0, 0.0, 0.0)
+        collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+        return (
+            False,
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_hessian,
+            collision_hessian,
+            collision_hessian,
+            collision_hessian,
+            mat32(0.0,0.0,0.0,0.0,0.0,0.0), # T
+            collision_normal,
+            0.0, # u_norm
+            0.0, # eps_U
+            collision_force, # friction_force
+            collision_force, # ncfs
+            collision_force, # ncfm
+
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_force,
+            collision_force,
+        )
+
+
+
 @wp.func
 def compute_friction(mu: float, normal_contact_force: float, T: mat32, u: wp.vec2, eps_u: float):
     """
@@ -1421,6 +1823,7 @@ def solve_trimesh_no_self_contact_tile(
     particle_hessians: wp.array(dtype=wp.mat33),
     # output
     pos_new: wp.array(dtype=wp.vec3),
+    stvk_forces: wp.array(dtype=wp.vec3)
 ):
     tid = wp.tid()
     block_idx = tid // TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
@@ -1468,6 +1871,7 @@ def solve_trimesh_no_self_contact_tile(
             dt,
         )
         # compute damping
+        stvk_forces[particle_index] += f_tri
 
         f += f_tri
         h += h_tri
@@ -1505,6 +1909,7 @@ def solve_trimesh_no_self_contact_tile(
                 edge_bending_properties[nei_edge_index, 1],
                 dt,
             )
+            stvk_forces[particle_index] += f_edge
 
             f += f_edge
             h += h_edge
@@ -1556,6 +1961,7 @@ def solve_trimesh_no_self_contact(
     particle_hessians: wp.array(dtype=wp.mat33),
     # output
     pos_new: wp.array(dtype=wp.vec3),
+    stvk_forces: wp.array(dtype=wp.vec3)
 ):
     tid = wp.tid()
 
@@ -1606,6 +2012,7 @@ def solve_trimesh_no_self_contact(
             tri_materials[tri_id, 2],
             dt,
         )
+        stvk_forces[particle_index] += f_tri
 
         f = f + f_tri
         h = h + h_tri
@@ -1636,6 +2043,7 @@ def solve_trimesh_no_self_contact(
                 edge_bending_properties[nei_edge_index, 1],
                 dt,
             )
+            stvk_forces[particle_index] += f_edge
 
             f += f_edge
             h += h_edge
@@ -1889,6 +2297,499 @@ def accumulate_contact_force_and_hessian(
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+
+
+@wp.kernel
+def accumulate_contact_force_and_hessian_log_collision(
+    # inputs
+    dt: float,
+    current_color: int,
+    pos_anchor: wp.array(dtype=wp.vec3),
+    pos: wp.array(dtype=wp.vec3),
+    particle_colors: wp.array(dtype=int),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    # self contact
+    collision_info_array: wp.array(dtype=TriMeshCollisionInfo),
+    collision_radius: float,
+    soft_contact_ke: float,
+    soft_contact_kd: float,
+    friction_mu: float,
+    friction_epsilon: float,
+    edge_edge_parallel_epsilon: float,
+    # body-particle contact
+    particle_radius: wp.array(dtype=float),
+    body_particle_contact_particle: wp.array(dtype=int),
+    body_particle_contact_count: wp.array(dtype=int),
+    body_particle_contact_max: int,
+    # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
+    body_particle_contact_penalty_k: wp.array(dtype=float),
+    body_particle_contact_material_kd: wp.array(dtype=float),
+    body_particle_contact_material_mu: wp.array(dtype=float),
+    shape_material_mu: wp.array(dtype=float),
+    shape_body: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    body_q_prev: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    body_com: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    contact_body_pos: wp.array(dtype=wp.vec3),
+    contact_body_vel: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+
+    collision_counter: wp.array(dtype=int),
+    # outputs: particle force and hessian
+    particle_forces: wp.array(dtype=wp.vec3),
+    particle_hessians: wp.array(dtype=wp.mat33),
+
+    contacts_index: wp.array(dtype=int),
+    contacts_is_self_col: wp.array(dtype=bool),
+    contacts_is_body_cloth_col: wp.array(dtype=bool),
+    contacts_is_vt_col: wp.array(dtype=bool),
+    contacts_is_ee_col: wp.array(dtype=bool),
+    contacts_vid: wp.array(dtype=int),
+    contacts_fid: wp.array(dtype=int),
+    contacts_eid1: wp.array(dtype=int),
+    contacts_eid2: wp.array(dtype=int),
+    contacts_Tx: wp.array(dtype=float), contacts_Ty: wp.array(dtype=float), contacts_Tz: wp.array(dtype=float),
+    contacts_Bx: wp.array(dtype=float), contacts_By: wp.array(dtype=float), contacts_Bz: wp.array(dtype=float),
+    contacts_collision_normal_x: wp.array(dtype=float), contacts_collision_normal_y: wp.array(dtype=float), contacts_collision_normal_z: wp.array(dtype=float),
+    contacts_u_norm: wp.array(dtype=float),
+    contacts_eps_u: wp.array(dtype=float),
+    contacts_is_slip: wp.array(dtype=bool),
+    contacts_friction_force_x: wp.array(dtype=float), contacts_friction_force_y: wp.array(dtype=float), contacts_friction_force_z: wp.array(dtype=float),
+    contacts_normal_contact_force_sum_x: wp.array(dtype=float), contacts_normal_contact_force_sum_y: wp.array(dtype=float), contacts_normal_contact_force_sum_z: wp.array(dtype=float),
+    contacts_normal_contact_force_min_x: wp.array(dtype=float), contacts_normal_contact_force_min_y: wp.array(dtype=float), contacts_normal_contact_force_min_z: wp.array(dtype=float),
+
+    contacts_normal_contact_force0_x: wp.array(dtype=float),
+    contacts_normal_contact_force0_y: wp.array(dtype=float),
+    contacts_normal_contact_force0_z: wp.array(dtype=float),
+    contacts_normal_contact_force1_x: wp.array(dtype=float),
+    contacts_normal_contact_force1_y: wp.array(dtype=float),
+    contacts_normal_contact_force1_z: wp.array(dtype=float),
+    contacts_normal_contact_force2_x: wp.array(dtype=float),
+    contacts_normal_contact_force2_y: wp.array(dtype=float),
+    contacts_normal_contact_force2_z: wp.array(dtype=float),
+    contacts_normal_contact_force3_x: wp.array(dtype=float),
+    contacts_normal_contact_force3_y: wp.array(dtype=float),
+    contacts_normal_contact_force3_z: wp.array(dtype=float),
+    contacts_friction0_x: wp.array(dtype=float),
+    contacts_friction0_y: wp.array(dtype=float),
+    contacts_friction0_z: wp.array(dtype=float),
+    contacts_friction1_x: wp.array(dtype=float),
+    contacts_friction1_y: wp.array(dtype=float),
+    contacts_friction1_z: wp.array(dtype=float),
+    contacts_friction2_x: wp.array(dtype=float),
+    contacts_friction2_y: wp.array(dtype=float),
+    contacts_friction2_z: wp.array(dtype=float),
+    contacts_friction3_x: wp.array(dtype=float),
+    contacts_friction3_y: wp.array(dtype=float),
+    contacts_friction3_z: wp.array(dtype=float),
+    contacts_v_list: wp.array(dtype=wp.vec4i),
+    contacts_mu: wp.array(dtype=float)
+):
+    t_id = wp.tid()
+    collision_info = collision_info_array[0]
+
+    primitive_id = t_id // NUM_THREADS_PER_COLLISION_PRIMITIVE
+    t_id_current_primitive = t_id % NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # process edge-edge collisions
+    if primitive_id < collision_info.edge_colliding_edges_buffer_sizes.shape[0]:
+        e1_idx = primitive_id
+
+        collision_buffer_counter = t_id_current_primitive
+        collision_buffer_offset = collision_info.edge_colliding_edges_offsets[primitive_id]
+        while collision_buffer_counter < collision_info.edge_colliding_edges_buffer_sizes[primitive_id]:
+            e2_idx = collision_info.edge_colliding_edges[2 * (collision_buffer_offset + collision_buffer_counter) + 1]
+
+            if e1_idx != -1 and e2_idx != -1:
+                e1_v1 = edge_indices[e1_idx, 2]
+                e1_v2 = edge_indices[e1_idx, 3]
+
+                c_e1_v1 = particle_colors[e1_v1]
+                c_e1_v2 = particle_colors[e1_v2]
+                if c_e1_v1 == current_color or c_e1_v2 == current_color:
+                    (has_contact, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1,
+                    
+
+                        T,
+                        collision_normal,
+                        u_norm,
+                        eps_u,
+                        friction_force,
+                        normal_contact_force_sum,
+                        normal_contact_force_min,
+
+                        contacts_normal_contact_force0,
+                        contacts_normal_contact_force1,
+                        contacts_normal_contact_force2,
+                        contacts_normal_contact_force3,
+                        contacts_friction0,
+                        contacts_friction1,
+                        contacts_friction2,
+                        contacts_friction3
+                    ) = (
+                        evaluate_edge_edge_contact_2_vertices_log_collision(
+                            e1_idx,
+                            e2_idx,
+                            pos,
+                            pos_anchor,
+                            edge_indices,
+                            collision_radius,
+                            soft_contact_ke,
+                            soft_contact_kd,
+                            friction_mu,
+                            friction_epsilon,
+                            dt,
+                            edge_edge_parallel_epsilon,
+                        )
+                    )
+
+                    if has_contact:
+                        # logging
+                        index = wp.atomic_add(collision_counter, 0, 1)
+                        if index < collision_counter[0]:
+                            contacts_index[index] = index
+                            contacts_is_self_col[index] = True
+                            contacts_is_body_cloth_col[index] = False
+                            contacts_is_vt_col[index] = False
+                            contacts_is_ee_col[index] = True
+                            contacts_vid[index] = -1
+                            contacts_fid[index] = -1
+                            contacts_eid1[index] = e1_v1
+                            contacts_eid2[index] = e1_v2
+                            contacts_Tx[index] = T[0,0] 
+                            contacts_Ty[index] = T[1,0]
+                            contacts_Tz[index] = T[2,0]
+                            contacts_Bx[index] = T[0,1]
+                            contacts_By[index] = T[1,1]
+                            contacts_Bz[index] = T[2,1]
+                            contacts_collision_normal_x[index] = collision_normal[0]
+                            contacts_collision_normal_y[index] = collision_normal[1]
+                            contacts_collision_normal_z[index] = collision_normal[2]
+                            contacts_u_norm[index] = u_norm
+                            contacts_eps_u[index] = eps_u
+                            contacts_is_slip[index] = u_norm > eps_u
+                            contacts_friction_force_x[index] = friction_force[0]
+                            contacts_friction_force_y[index] = friction_force[1]
+                            contacts_friction_force_z[index] = friction_force[2]
+                            contacts_normal_contact_force_sum_x[index] = normal_contact_force_sum[0]
+                            contacts_normal_contact_force_sum_y[index] = normal_contact_force_sum[1]
+                            contacts_normal_contact_force_sum_z[index] = normal_contact_force_sum[2]
+                            contacts_normal_contact_force_min_x[index] = normal_contact_force_min[0]
+                            contacts_normal_contact_force_min_y[index] = normal_contact_force_min[1]
+                            contacts_normal_contact_force_min_z[index] = normal_contact_force_min[2]
+
+                            contacts_normal_contact_force0_x[index] = contacts_normal_contact_force0[0]
+                            contacts_normal_contact_force0_y[index] = contacts_normal_contact_force0[1]
+                            contacts_normal_contact_force0_z[index] = contacts_normal_contact_force0[2]
+                            contacts_normal_contact_force1_x[index] = contacts_normal_contact_force1[0]
+                            contacts_normal_contact_force1_y[index] = contacts_normal_contact_force1[1]
+                            contacts_normal_contact_force1_z[index] = contacts_normal_contact_force1[2]
+                            contacts_normal_contact_force2_x[index] = contacts_normal_contact_force2[0]
+                            contacts_normal_contact_force2_y[index] = contacts_normal_contact_force2[1]
+                            contacts_normal_contact_force2_z[index] = contacts_normal_contact_force2[2]
+                            contacts_normal_contact_force3_x[index] = contacts_normal_contact_force3[0]
+                            contacts_normal_contact_force3_y[index] = contacts_normal_contact_force3[1]
+                            contacts_normal_contact_force3_z[index] = contacts_normal_contact_force3[2]
+                            contacts_friction0_x[index] = contacts_friction0[0]
+                            contacts_friction0_y[index] = contacts_friction0[1]
+                            contacts_friction0_z[index] = contacts_friction0[2]
+                            contacts_friction1_x[index] = contacts_friction1[0]
+                            contacts_friction1_y[index] = contacts_friction1[1]
+                            contacts_friction1_z[index] = contacts_friction1[2]
+                            contacts_friction2_x[index] = contacts_friction2[0]
+                            contacts_friction2_y[index] = contacts_friction2[1]
+                            contacts_friction2_z[index] = contacts_friction2[2]
+                            contacts_friction3_x[index] = contacts_friction3[0]
+                            contacts_friction3_y[index] = contacts_friction3[1]
+                            contacts_friction3_z[index] = contacts_friction3[2]
+
+                            contacts_v_list[index] = wp.vec4i(e1_v1, e1_v2, 0, 0)
+                            contacts_mu[index] = friction_mu
+
+
+                        # here we only handle the e1 side, because e2 will also detection this contact and add force and hessian on its own
+                        if c_e1_v1 == current_color:
+                            wp.atomic_add(particle_forces, e1_v1, collision_force_0)
+                            wp.atomic_add(particle_hessians, e1_v1, collision_hessian_0)
+                        if c_e1_v2 == current_color:
+                            wp.atomic_add(particle_forces, e1_v2, collision_force_1)
+                            wp.atomic_add(particle_hessians, e1_v2, collision_hessian_1)
+            collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # process vertex-triangle collisions
+    if primitive_id < collision_info.vertex_colliding_triangles_buffer_sizes.shape[0]:
+        particle_idx = primitive_id
+        collision_buffer_counter = t_id_current_primitive
+        collision_buffer_offset = collision_info.vertex_colliding_triangles_offsets[primitive_id]
+        while collision_buffer_counter < collision_info.vertex_colliding_triangles_buffer_sizes[primitive_id]:
+            tri_idx = collision_info.vertex_colliding_triangles[
+                (collision_buffer_offset + collision_buffer_counter) * 2 + 1
+            ]
+
+            if particle_idx != -1 and tri_idx != -1:
+                tri_a = tri_indices[tri_idx, 0]
+                tri_b = tri_indices[tri_idx, 1]
+                tri_c = tri_indices[tri_idx, 2]
+
+                c_v = particle_colors[particle_idx]
+                c_tri_a = particle_colors[tri_a]
+                c_tri_b = particle_colors[tri_b]
+                c_tri_c = particle_colors[tri_c]
+
+                if (
+                    c_v == current_color
+                    or c_tri_a == current_color
+                    or c_tri_b == current_color
+                    or c_tri_c == current_color
+                ):
+                    (
+                        has_contact,
+                        collision_force_0,
+                        collision_force_1,
+                        collision_force_2,
+                        collision_force_3,
+                        collision_hessian_0,
+                        collision_hessian_1,
+                        collision_hessian_2,
+                        collision_hessian_3,
+
+                        T,
+                        collision_normal,
+                        u_norm,
+                        eps_u,
+                        friction_force,
+                        normal_contact_force_sum,
+                        normal_contact_force_min,
+
+                        contacts_normal_contact_force0,
+                        contacts_normal_contact_force1,
+                        contacts_normal_contact_force2,
+                        contacts_normal_contact_force3,
+                        contacts_friction0,
+                        contacts_friction1,
+                        contacts_friction2,
+                        contacts_friction3
+                    ) = evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
+                        particle_idx,
+                        tri_idx,
+                        pos,
+                        pos_anchor,
+                        tri_indices,
+                        collision_radius,
+                        soft_contact_ke,
+                        soft_contact_kd,
+                        friction_mu,
+                        friction_epsilon,
+                        dt,
+                    )
+                    
+                    if has_contact:
+                        # logging
+                        index = wp.atomic_add(collision_counter, 0, 1)
+                        if index < collision_counter[0]:
+                            contacts_index[index] = index
+                            contacts_is_self_col[index] = True
+                            contacts_is_body_cloth_col[index] = False
+                            contacts_is_vt_col[index] = True
+                            contacts_is_ee_col[index] = False
+                            contacts_vid[index] = particle_idx
+                            contacts_fid[index] = tri_idx
+                            contacts_eid1[index] = -1
+                            contacts_eid2[index] = -1
+                            contacts_Tx[index] = T[0,0] 
+                            contacts_Ty[index] = T[1,0]
+                            contacts_Tz[index] = T[2,0]
+                            contacts_Bx[index] = T[0,1]
+                            contacts_By[index] = T[1,1]
+                            contacts_Bz[index] = T[2,1]
+                            contacts_collision_normal_x[index] = collision_normal[0]
+                            contacts_collision_normal_y[index] = collision_normal[1]
+                            contacts_collision_normal_z[index] = collision_normal[2]
+                            contacts_u_norm[index] = u_norm
+                            contacts_eps_u[index] = eps_u
+                            contacts_is_slip[index] = u_norm > eps_u
+                            contacts_friction_force_x[index] = friction_force[0]
+                            contacts_friction_force_y[index] = friction_force[1]
+                            contacts_friction_force_z[index] = friction_force[2]
+                            contacts_normal_contact_force_sum_x[index] = normal_contact_force_sum[0]
+                            contacts_normal_contact_force_sum_y[index] = normal_contact_force_sum[1]
+                            contacts_normal_contact_force_sum_z[index] = normal_contact_force_sum[2]
+                            contacts_normal_contact_force_min_x[index] = normal_contact_force_min[0]
+                            contacts_normal_contact_force_min_y[index] = normal_contact_force_min[1]
+                            contacts_normal_contact_force_min_z[index] = normal_contact_force_min[2]
+
+
+
+                            contacts_normal_contact_force0_x[index] = contacts_normal_contact_force0[0]
+                            contacts_normal_contact_force0_y[index] = contacts_normal_contact_force0[1]
+                            contacts_normal_contact_force0_z[index] = contacts_normal_contact_force0[2]
+                            contacts_normal_contact_force1_x[index] = contacts_normal_contact_force1[0]
+                            contacts_normal_contact_force1_y[index] = contacts_normal_contact_force1[1]
+                            contacts_normal_contact_force1_z[index] = contacts_normal_contact_force1[2]
+                            contacts_normal_contact_force2_x[index] = contacts_normal_contact_force2[0]
+                            contacts_normal_contact_force2_y[index] = contacts_normal_contact_force2[1]
+                            contacts_normal_contact_force2_z[index] = contacts_normal_contact_force2[2]
+                            contacts_normal_contact_force3_x[index] = contacts_normal_contact_force3[0]
+                            contacts_normal_contact_force3_y[index] = contacts_normal_contact_force3[1]
+                            contacts_normal_contact_force3_z[index] = contacts_normal_contact_force3[2]
+                            contacts_friction0_x[index] = contacts_friction0[0]
+                            contacts_friction0_y[index] = contacts_friction0[1]
+                            contacts_friction0_z[index] = contacts_friction0[2]
+                            contacts_friction1_x[index] = contacts_friction1[0]
+                            contacts_friction1_y[index] = contacts_friction1[1]
+                            contacts_friction1_z[index] = contacts_friction1[2]
+                            contacts_friction2_x[index] = contacts_friction2[0]
+                            contacts_friction2_y[index] = contacts_friction2[1]
+                            contacts_friction2_z[index] = contacts_friction2[2]
+                            contacts_friction3_x[index] = contacts_friction3[0]
+                            contacts_friction3_y[index] = contacts_friction3[1]
+                            contacts_friction3_z[index] = contacts_friction3[2]
+
+                            contacts_v_list[index] = wp.vec4i(tri_a, tri_b, tri_c, particle_idx)
+                            contacts_mu[index] = friction_mu
+                        # particle
+                        if c_v == current_color:
+                            wp.atomic_add(particle_forces, particle_idx, collision_force_3)
+                            wp.atomic_add(particle_hessians, particle_idx, collision_hessian_3)
+
+                        # tri_a
+                        if c_tri_a == current_color:
+                            wp.atomic_add(particle_forces, tri_a, collision_force_0)
+                            wp.atomic_add(particle_hessians, tri_a, collision_hessian_0)
+
+                        # tri_b
+                        if c_tri_b == current_color:
+                            wp.atomic_add(particle_forces, tri_b, collision_force_1)
+                            wp.atomic_add(particle_hessians, tri_b, collision_hessian_1)
+
+                        # tri_c
+                        if c_tri_c == current_color:
+                            wp.atomic_add(particle_forces, tri_c, collision_force_2)
+                            wp.atomic_add(particle_hessians, tri_c, collision_hessian_2)
+            collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    particle_body_contact_count = min(body_particle_contact_max, body_particle_contact_count[0])
+
+    if t_id < particle_body_contact_count:
+        particle_idx = body_particle_contact_particle[t_id]
+
+        if particle_colors[particle_idx] == current_color:
+            # Read per-contact AVBD penalty and material properties shared with the rigid side
+            contact_ke = body_particle_contact_penalty_k[t_id]
+            contact_kd = body_particle_contact_material_kd[t_id]
+            contact_mu = body_particle_contact_material_mu[t_id]
+
+
+            (body_contact_force, body_contact_hessian,
+            Tv,
+            Bv,
+            collision_normal,
+            u_norm,
+            eps_u,
+            friction_force,
+
+            contacts_normal_contact_force0,
+            contacts_normal_contact_force1,
+            contacts_normal_contact_force2,
+            contacts_normal_contact_force3,
+            contacts_friction0,
+            contacts_friction1,
+            contacts_friction2,
+            contacts_friction3,
+            mu
+            ) = evaluate_body_particle_contact_log_collision(
+                particle_idx,
+                pos[particle_idx],
+                pos_anchor[particle_idx],
+                t_id,
+                contact_ke,
+                contact_kd,
+                contact_mu,
+                friction_epsilon,
+                particle_radius,
+                shape_material_mu,
+                shape_body,
+                body_q,
+                body_q_prev,
+                body_qd,
+                body_com,
+                contact_shape,
+                contact_body_pos,
+                contact_body_vel,
+                contact_normal,
+                dt,
+            )
+
+            index = wp.atomic_add(collision_counter, 0, 1)
+            if index < collision_counter[0]:
+                contacts_index[index] = index
+                contacts_is_self_col[index] = False
+                contacts_is_body_cloth_col[index] = True
+                contacts_is_vt_col[index] = False # both false means we don't know
+                contacts_is_ee_col[index] = False
+                contacts_vid[index] = particle_idx
+                contacts_fid[index] = -1
+                contacts_eid1[index] = -1
+                contacts_eid2[index] = -1
+                contacts_Tx[index] = Tv[0] # both zero vec
+                contacts_Ty[index] = Tv[1]
+                contacts_Tz[index] = Tv[2]
+                contacts_Bx[index] = Bv[0]
+                contacts_By[index] = Bv[1]
+                contacts_Bz[index] = Bv[2]
+                contacts_collision_normal_x[index] = collision_normal[0]
+                contacts_collision_normal_y[index] = collision_normal[1]
+                contacts_collision_normal_z[index] = collision_normal[2]
+                contacts_u_norm[index] = u_norm
+                contacts_eps_u[index] = eps_u
+                contacts_is_slip[index] = u_norm > eps_u
+                contacts_friction_force_x[index] = friction_force[0]
+                contacts_friction_force_y[index] = friction_force[1]
+                contacts_friction_force_z[index] = friction_force[2]
+                contacts_normal_contact_force_sum_x[index] = body_contact_force[0]
+                contacts_normal_contact_force_sum_y[index] = body_contact_force[1]
+                contacts_normal_contact_force_sum_z[index] = body_contact_force[2]
+                contacts_normal_contact_force_min_x[index] = body_contact_force[0]
+                contacts_normal_contact_force_min_y[index] = body_contact_force[1]
+                contacts_normal_contact_force_min_z[index] = body_contact_force[2]
+
+
+
+                contacts_normal_contact_force0_x[index] = contacts_normal_contact_force0[0]
+                contacts_normal_contact_force0_y[index] = contacts_normal_contact_force0[1]
+                contacts_normal_contact_force0_z[index] = contacts_normal_contact_force0[2]
+                contacts_normal_contact_force1_x[index] = contacts_normal_contact_force1[0]
+                contacts_normal_contact_force1_y[index] = contacts_normal_contact_force1[1]
+                contacts_normal_contact_force1_z[index] = contacts_normal_contact_force1[2]
+                contacts_normal_contact_force2_x[index] = contacts_normal_contact_force2[0]
+                contacts_normal_contact_force2_y[index] = contacts_normal_contact_force2[1]
+                contacts_normal_contact_force2_z[index] = contacts_normal_contact_force2[2]
+                contacts_normal_contact_force3_x[index] = contacts_normal_contact_force3[0]
+                contacts_normal_contact_force3_y[index] = contacts_normal_contact_force3[1]
+                contacts_normal_contact_force3_z[index] = contacts_normal_contact_force3[2]
+                contacts_friction0_x[index] = contacts_friction0[0]
+                contacts_friction0_y[index] = contacts_friction0[1]
+                contacts_friction0_z[index] = contacts_friction0[2]
+                contacts_friction1_x[index] = contacts_friction1[0]
+                contacts_friction1_y[index] = contacts_friction1[1]
+                contacts_friction1_z[index] = contacts_friction1[2]
+                contacts_friction2_x[index] = contacts_friction2[0]
+                contacts_friction2_y[index] = contacts_friction2[1]
+                contacts_friction2_z[index] = contacts_friction2[2]
+                contacts_friction3_x[index] = contacts_friction3[0]
+                contacts_friction3_y[index] = contacts_friction3[1]
+                contacts_friction3_z[index] = contacts_friction3[2]
+
+                contacts_v_list[index] = wp.vec4i(particle_idx, 0, 0, 0)
+                contacts_mu[index] = mu
+
+            wp.atomic_add(particle_forces, particle_idx, body_contact_force)
+            wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+
+
 
 
 def _csr_row(vals: np.ndarray, offs: np.ndarray, i: int) -> np.ndarray:
@@ -2246,6 +3147,7 @@ def solve_trimesh_with_self_contact_penetration_free(
     particle_conservative_bounds: wp.array(dtype=float),
     # output
     pos_new: wp.array(dtype=wp.vec3),
+    stvk_forces: wp.array(dtype=wp.vec3)
 ):
     t_id = wp.tid()
 
@@ -2303,6 +3205,7 @@ def solve_trimesh_with_self_contact_penetration_free(
             tri_materials[tri_index, 2],
             dt,
         )
+        stvk_forces[particle_index] += f_tri
 
         f = f + f_tri
         h = h + h_tri
@@ -2318,6 +3221,8 @@ def solve_trimesh_with_self_contact_penetration_free(
                 edge_bending_properties[nei_edge_index, 1],
                 dt,
             )
+
+            stvk_forces[particle_index] += f_edge
 
             f = f + f_edge
             h = h + h_edge
@@ -2368,6 +3273,7 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
     particle_conservative_bounds: wp.array(dtype=float),
     # output
     pos_new: wp.array(dtype=wp.vec3),
+    stvk_forces: wp.array(dtype=wp.vec3)
 ):
     tid = wp.tid()
     block_idx = tid // TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
@@ -2428,6 +3334,8 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             dt,
         )
 
+        stvk_forces[particle_index] += f_tri
+
         f += f_tri
         h += h_tri
 
@@ -2452,7 +3360,7 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
                 edge_bending_properties[nei_edge_index, 1],
                 dt,
             )
-
+            stvk_forces[particle_index] += f_edge
             f += f_edge
             h += h_edge
 

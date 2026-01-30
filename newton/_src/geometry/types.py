@@ -168,6 +168,7 @@ class Mesh:
 
         self._vertices = np.array(vertices, dtype=np.float32).reshape(-1, 3)
         self._indices = np.array(indices, dtype=np.int32).flatten()
+        print(len(indices), 'and flattened to ', len(self._indices))
         self._normals = np.array(normals, dtype=np.float32).reshape(-1, 3) if normals is not None else None
         self._uvs = np.array(uvs, dtype=np.float32).reshape(-1, 2) if uvs is not None else None
         self._color = color

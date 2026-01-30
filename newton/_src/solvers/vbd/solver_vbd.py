@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from newton import data_collector
+import time
+
 import warnings
 
 import numpy as np
@@ -30,6 +33,7 @@ from .particle_vbd_kernels import (
     # Topological filtering helper functions
     _set_to_csr,
     accumulate_contact_force_and_hessian,
+    accumulate_contact_force_and_hessian_log_collision,
     accumulate_contact_force_and_hessian_no_self_contact,
     accumulate_spring_force_and_hessian,
     build_edge_n_ring_edge_collision_filter,
@@ -246,6 +250,7 @@ class SolverVBD(SolverBase):
 
         # Common parameters
         self.iterations = iterations
+        data_collector.record_to_scene("iter_per_substep", self.iterations)
         self.friction_epsilon = friction_epsilon
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -386,7 +391,73 @@ class SolverVBD(SolverBase):
 
         # Particle force and hessian storage
         self.particle_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
+        self.stvk_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.particle_hessians = wp.zeros(self.model.particle_count, dtype=wp.mat33, device=self.device)
+
+        if data_collector.is_log_collision():
+            vt_contact_max = self.model.particle_count * particle_vertex_contact_buffer_size
+            ee_contact_max = self.model.particle_count * particle_edge_contact_buffer_size
+            self.collision_counter = wp.zeros(1, dtype=int)
+            self.all_collision_count = int(soft_contact_max + vt_contact_max + ee_contact_max)
+            print(self.all_collision_count, "here")
+            self.contacts_index = wp.empty(self.all_collision_count, dtype=int)
+            self.contacts_is_self_col = wp.empty(self.all_collision_count, dtype=bool)
+            self.contacts_is_body_cloth_col = wp.empty(self.all_collision_count, dtype=bool)
+            self.contacts_is_vt_col = wp.empty(self.all_collision_count, dtype=bool)
+            self.contacts_is_ee_col = wp.empty(self.all_collision_count, dtype=bool)
+            self.contacts_vid = wp.empty(self.all_collision_count, dtype=int)
+            self.contacts_fid = wp.empty(self.all_collision_count, dtype=int)
+            self.contacts_eid1 = wp.empty(self.all_collision_count, dtype=int)
+            self.contacts_eid2 = wp.empty(self.all_collision_count, dtype=int)
+            self.contacts_Tx = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_Ty = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_Tz = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_Bx = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_By = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_Bz = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_collision_normal_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_collision_normal_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_collision_normal_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_u_norm = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_eps_u = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_is_slip = wp.empty(self.all_collision_count, dtype=bool, device=self.device)
+            self.contacts_friction_force_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction_force_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction_force_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force_sum_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force_sum_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force_sum_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force_min_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force_min_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force_min_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+
+
+            self.contacts_normal_contact_force0_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force0_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force0_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force1_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force1_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force1_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force2_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force2_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force2_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force3_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force3_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_normal_contact_force3_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction0_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction0_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction0_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction1_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction1_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction1_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction2_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction2_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction2_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction3_x = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction3_y = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_friction3_z = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+            self.contacts_v_list = wp.empty(self.all_collision_count, dtype=wp.vec4i, device=self.device)
+            self.contacts_mu = wp.empty(self.all_collision_count, dtype=float, device=self.device)
 
         # Validation
         if len(self.model.particle_color_groups) == 0:
@@ -906,13 +977,13 @@ class SolverVBD(SolverBase):
         # Use and reset the rigid history update flag (warmstarts).
         update_rigid_history = self.update_rigid_history
         self.update_rigid_history = True
-
+    
         self.initialize_rigid_bodies(state_in, contacts, dt, update_rigid_history)
         self.initialize_particles(state_in, dt)
 
         for iter_num in range(self.iterations):
             self.solve_rigid_body_iteration(state_in, state_out, contacts, dt)
-            self.solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+            self.solve_particle_iteration(state_in, state_out, contacts, dt, iter_num, self.iterations-1)
 
         self.finalize_rigid_bodies(state_out, dt)
         self.finalize_particles(state_out, dt)
@@ -927,7 +998,10 @@ class SolverVBD(SolverBase):
 
         if self.particle_enable_self_contact:
             # Collision detection before initialization to compute conservative bounds
-            self.collision_detection_penetration_free(state_in)
+            if data_collector.is_log_nothing():
+                self.collision_detection_penetration_free(state_in, -1)
+            else:
+                self.collision_detection_penetration_free_log_collision(state_in, -1)
 
             wp.launch(
                 kernel=forward_step_penetration_free,
@@ -1147,7 +1221,7 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
 
-    def solve_particle_iteration(self, state_in: State, state_out: State, contacts: Contacts, dt: float, iter_num: int):
+    def solve_particle_iteration(self, state_in: State, state_out: State, contacts: Contacts, dt: float, iter_num: int, max_iter_num=-1):
         """Solve one VBD iteration for particles."""
         model = self.model
 
@@ -1174,62 +1248,170 @@ class SolverVBD(SolverBase):
                 self.particle_collision_detection_interval >= 1
                 and iter_num % self.particle_collision_detection_interval == 0
             ):
-                self.collision_detection_penetration_free(state_in)
+                if data_collector.is_log_nothing():
+                    self.collision_detection_penetration_free(state_in, iter_num)
+                else:
+                    col_detect_time_start = time.perf_counter()
+                    self.collision_detection_penetration_free_log_collision(state_in, iter_num)
+                    col_detect_time_end = time.perf_counter()
+                    data_collector.record_to_frame("col_detect_time", col_detect_time_end - col_detect_time_start)
+            elif not data_collector.is_log_nothing():
+                data_collector.record_to_frame("col_detect_time", 0)
+        elif not data_collector.is_log_nothing():
+            data_collector.record_to_frame("col_detect_time", 0)
 
         # Zero out forces and hessians
         self.particle_forces.zero_()
         self.particle_hessians.zero_()
+        self.stvk_forces.zero_()
+        if data_collector.is_log_collision():
+            self.collision_counter.zero_()
 
         # Iterate over color groups
         for color in range(len(model.particle_color_groups)):
             # Accumulate contact forces
             if self.particle_enable_self_contact:
                 if contacts is not None:
-                    wp.launch(
-                        kernel=accumulate_contact_force_and_hessian,
-                        dim=self.collision_evaluation_kernel_launch_size,
-                        inputs=[
-                            dt,
-                            color,
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            model.particle_colors,
-                            model.tri_indices,
-                            model.edge_indices,
-                            # self-contact
-                            self.trimesh_collision_info,
-                            self.particle_self_contact_radius,
-                            model.soft_contact_ke,
-                            model.soft_contact_kd,
-                            model.soft_contact_mu,
-                            self.friction_epsilon,
-                            self.trimesh_collision_detector.edge_edge_parallel_epsilon,
-                            # body-particle contact
-                            model.particle_radius,
-                            contacts.soft_contact_particle,
-                            contacts.soft_contact_count,
-                            contacts.soft_contact_max,
-                            self.body_particle_contact_penalty_k,
-                            self.body_particle_contact_material_kd,
-                            self.body_particle_contact_material_mu,
-                            model.shape_material_mu,
-                            model.shape_body,
-                            body_q_for_particles,
-                            body_q_prev_for_particles,
-                            body_qd_for_particles,
-                            model.body_com,
-                            contacts.soft_contact_shape,
-                            contacts.soft_contact_body_pos,
-                            contacts.soft_contact_body_vel,
-                            contacts.soft_contact_normal,
-                        ],
-                        outputs=[
-                            self.particle_forces,
-                            self.particle_hessians,
-                        ],
-                        device=self.device,
-                        max_blocks=model.device.sm_count,
-                    )
+                    if data_collector.is_log_collision() and iter_num == max_iter_num:
+                        wp.launch(
+                            kernel=accumulate_contact_force_and_hessian_log_collision,
+                            dim=self.collision_evaluation_kernel_launch_size,
+                            inputs=[
+                                dt,
+                                color,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                model.particle_colors,
+                                model.tri_indices,
+                                model.edge_indices,
+                                # self-contact
+                                self.trimesh_collision_info,
+                                self.particle_self_contact_radius,
+                                model.soft_contact_ke,
+                                model.soft_contact_kd,
+                                model.soft_contact_mu, # also friction mu
+                                self.friction_epsilon,
+                                self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                                # body-particle contact
+                                model.particle_radius,
+                                contacts.soft_contact_particle,
+                                contacts.soft_contact_count,
+                                contacts.soft_contact_max,
+                                self.body_particle_contact_penalty_k,
+                                self.body_particle_contact_material_kd,
+                                self.body_particle_contact_material_mu,
+                                model.shape_material_mu,
+                                model.shape_body,
+                                body_q_for_particles,
+                                body_q_prev_for_particles,
+                                body_qd_for_particles,
+                                model.body_com,
+                                contacts.soft_contact_shape,
+                                contacts.soft_contact_body_pos,
+                                contacts.soft_contact_body_vel,
+                                contacts.soft_contact_normal,
+
+                                self.collision_counter,
+                            ],
+                            outputs=[
+                                self.particle_forces,
+                                self.particle_hessians,
+
+                                self.contacts_index,
+                                self.contacts_is_self_col,
+                                self.contacts_is_body_cloth_col,
+                                self.contacts_is_vt_col,
+                                self.contacts_is_ee_col,
+                                self.contacts_vid,
+                                self.contacts_fid,
+                                self.contacts_eid1,
+                                self.contacts_eid2,
+                                self.contacts_Tx, self.contacts_Ty, self.contacts_Tz,
+                                self.contacts_Bx, self.contacts_By, self.contacts_Bz,
+                                self.contacts_collision_normal_x, self.contacts_collision_normal_y, self.contacts_collision_normal_z,
+                                self.contacts_u_norm,
+                                self.contacts_eps_u,
+                                self.contacts_is_slip,
+                                self.contacts_friction_force_x, self.contacts_friction_force_y, self.contacts_friction_force_z,
+                                self.contacts_normal_contact_force_sum_x, self.contacts_normal_contact_force_sum_y, self.contacts_normal_contact_force_sum_z,
+                                self.contacts_normal_contact_force_min_x, self.contacts_normal_contact_force_min_y, self.contacts_normal_contact_force_min_z,
+
+                                self.contacts_normal_contact_force0_x,
+                                self.contacts_normal_contact_force0_y,
+                                self.contacts_normal_contact_force0_z,
+                                self.contacts_normal_contact_force1_x,
+                                self.contacts_normal_contact_force1_y,
+                                self.contacts_normal_contact_force1_z,
+                                self.contacts_normal_contact_force2_x,
+                                self.contacts_normal_contact_force2_y,
+                                self.contacts_normal_contact_force2_z,
+                                self.contacts_normal_contact_force3_x,
+                                self.contacts_normal_contact_force3_y,
+                                self.contacts_normal_contact_force3_z,
+                                self.contacts_friction0_x,
+                                self.contacts_friction0_y,
+                                self.contacts_friction0_z,
+                                self.contacts_friction1_x,
+                                self.contacts_friction1_y,
+                                self.contacts_friction1_z,
+                                self.contacts_friction2_x,
+                                self.contacts_friction2_y,
+                                self.contacts_friction2_z,
+                                self.contacts_friction3_x,
+                                self.contacts_friction3_y,
+                                self.contacts_friction3_z,
+                                self.contacts_v_list,
+                                self.contacts_mu
+                            ],
+                            device=self.device,
+                            max_blocks=model.device.sm_count,
+                        )
+                    else:
+                        wp.launch(
+                            kernel=accumulate_contact_force_and_hessian,
+                            dim=self.collision_evaluation_kernel_launch_size,
+                            inputs=[
+                                dt,
+                                color,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                model.particle_colors,
+                                model.tri_indices,
+                                model.edge_indices,
+                                # self-contact
+                                self.trimesh_collision_info,
+                                self.particle_self_contact_radius,
+                                model.soft_contact_ke,
+                                model.soft_contact_kd,
+                                model.soft_contact_mu,
+                                self.friction_epsilon,
+                                self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                                # body-particle contact
+                                model.particle_radius,
+                                contacts.soft_contact_particle,
+                                contacts.soft_contact_count,
+                                contacts.soft_contact_max,
+                                self.body_particle_contact_penalty_k,
+                                self.body_particle_contact_material_kd,
+                                self.body_particle_contact_material_mu,
+                                model.shape_material_mu,
+                                model.shape_body,
+                                body_q_for_particles,
+                                body_q_prev_for_particles,
+                                body_qd_for_particles,
+                                model.body_com,
+                                contacts.soft_contact_shape,
+                                contacts.soft_contact_body_pos,
+                                contacts.soft_contact_body_vel,
+                                contacts.soft_contact_normal,
+                            ],
+                            outputs=[
+                                self.particle_forces,
+                                self.particle_hessians,
+                            ],
+                            device=self.device,
+                            max_blocks=model.device.sm_count,
+                        )
             else:
                 wp.launch(
                     kernel=accumulate_contact_force_and_hessian_no_self_contact,
@@ -1289,6 +1471,7 @@ class SolverVBD(SolverBase):
                     dim=model.particle_color_groups[color].size,
                     device=self.device,
                 )
+            
 
             # Solve for this color group
             if self.particle_enable_self_contact:
@@ -1320,7 +1503,10 @@ class SolverVBD(SolverBase):
                             self.pos_prev_collision_detection,
                             self.particle_conservative_bounds,
                         ],
-                        outputs=[state_out.particle_q],
+                        outputs=[
+                            state_out.particle_q,
+                            self.stvk_forces
+                        ],
                         device=self.device,
                     )
                 else:
@@ -1350,7 +1536,10 @@ class SolverVBD(SolverBase):
                             self.pos_prev_collision_detection,
                             self.particle_conservative_bounds,
                         ],
-                        outputs=[state_out.particle_q],
+                        outputs=[
+                            state_out.particle_q,
+                            self.stvk_forces    
+                        ],
                         device=self.device,
                     )
             else:
@@ -1378,7 +1567,10 @@ class SolverVBD(SolverBase):
                             self.particle_forces,
                             self.particle_hessians,
                         ],
-                        outputs=[state_out.particle_q],
+                        outputs=[
+                            state_out.particle_q,
+                            self.stvk_forces
+                        ],
                         dim=model.particle_color_groups[color].size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
                         block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
                         device=self.device,
@@ -1407,7 +1599,10 @@ class SolverVBD(SolverBase):
                             self.particle_forces,
                             self.particle_hessians,
                         ],
-                        outputs=[state_out.particle_q],
+                        outputs=[
+                            state_out.particle_q,
+                            self.stvk_forces
+                        ],
                         dim=model.particle_color_groups[color].size,
                         device=self.device,
                     )
@@ -1419,6 +1614,77 @@ class SolverVBD(SolverBase):
                 dim=model.particle_color_groups[color].size,
                 device=self.device,
             )
+        # end color loop
+        if not data_collector.is_log_nothing():
+            data_collector.frame_timer.stop()
+            total_force = (self.particle_forces + self.stvk_forces).numpy().reshape(-1, 3)
+            force_magnitudes = np.linalg.norm(total_force, axis=1)
+            mean_force = np.mean(force_magnitudes)
+            data_collector.record_to_iteration("force_residual", mean_force, iter_num)
+            
+            if data_collector.is_log_collision() and iter_num == max_iter_num:
+                valid_size = self.collision_counter.numpy()[0]
+                data_collector.record_to_collision(
+                    iter_num, 
+                    self.contacts_index.numpy()[:valid_size],
+                    self.contacts_is_self_col.numpy()[:valid_size],
+                    self.contacts_is_body_cloth_col.numpy()[:valid_size],
+                    self.contacts_is_vt_col.numpy()[:valid_size],
+                    self.contacts_is_ee_col.numpy()[:valid_size],
+                    self.contacts_vid.numpy()[:valid_size],
+                    self.contacts_fid.numpy()[:valid_size],
+                    self.contacts_eid1.numpy()[:valid_size],
+                    self.contacts_eid2.numpy()[:valid_size],
+                    self.contacts_Tx.numpy()[:valid_size],
+                    self.contacts_Ty.numpy()[:valid_size],
+                    self.contacts_Tz.numpy()[:valid_size],
+                    self.contacts_Bx.numpy()[:valid_size],
+                    self.contacts_By.numpy()[:valid_size],
+                    self.contacts_Bz.numpy()[:valid_size],
+                    self.contacts_collision_normal_x.numpy()[:valid_size],
+                    self.contacts_collision_normal_y.numpy()[:valid_size],
+                    self.contacts_collision_normal_z.numpy()[:valid_size],
+                    self.contacts_u_norm.numpy()[:valid_size],
+                    self.contacts_eps_u.numpy()[:valid_size],
+                    self.contacts_is_slip.numpy()[:valid_size],
+                    self.contacts_normal_contact_force_sum_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force_sum_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force_sum_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force_min_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force_min_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force_min_x.numpy()[:valid_size],
+                    self.contacts_friction_force_x.numpy()[:valid_size],
+                    self.contacts_friction_force_y.numpy()[:valid_size],
+                    self.contacts_friction_force_z.numpy()[:valid_size],
+                    self.contacts_v_list.numpy()[:valid_size],
+                    self.contacts_normal_contact_force0_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force0_y.numpy()[:valid_size],
+                    self.contacts_normal_contact_force0_z.numpy()[:valid_size],
+                    self.contacts_normal_contact_force1_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force1_y.numpy()[:valid_size],
+                    self.contacts_normal_contact_force1_z.numpy()[:valid_size],
+                    self.contacts_normal_contact_force2_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force2_y.numpy()[:valid_size],
+                    self.contacts_normal_contact_force2_z.numpy()[:valid_size],
+                    self.contacts_normal_contact_force3_x.numpy()[:valid_size],
+                    self.contacts_normal_contact_force3_y.numpy()[:valid_size],
+                    self.contacts_normal_contact_force3_z.numpy()[:valid_size],
+                    self.contacts_friction0_x.numpy()[:valid_size],
+                    self.contacts_friction0_y.numpy()[:valid_size],
+                    self.contacts_friction0_z.numpy()[:valid_size],
+                    self.contacts_friction1_x.numpy()[:valid_size],
+                    self.contacts_friction1_y.numpy()[:valid_size],
+                    self.contacts_friction1_z.numpy()[:valid_size],
+                    self.contacts_friction2_x.numpy()[:valid_size],
+                    self.contacts_friction2_y.numpy()[:valid_size],
+                    self.contacts_friction2_z.numpy()[:valid_size],
+                    self.contacts_friction3_x.numpy()[:valid_size],
+                    self.contacts_friction3_y.numpy()[:valid_size],
+                    self.contacts_friction3_z.numpy()[:valid_size],
+                    self.contacts_mu.numpy()[:valid_size],
+                )
+            data_collector.frame_timer.start()
+        # print(self.contacts_T1, "<- t1")
 
     def solve_rigid_body_iteration(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).
@@ -1742,7 +2008,8 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
 
-    def collision_detection_penetration_free(self, current_state: State):
+    # called on init(1 time) and solve(iteration times)
+    def collision_detection_penetration_free(self, current_state: State, iter_num=-2):
         self.trimesh_collision_detector.refit(current_state.particle_q)
         self.trimesh_collision_detector.vertex_triangle_collision_detection(
             self.particle_self_contact_margin,
@@ -1754,6 +2021,39 @@ class SolverVBD(SolverBase):
             min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
             min_distance_filtering_ref_pos=self.particle_q_rest,
         )
+
+        self.pos_prev_collision_detection.assign(current_state.particle_q)
+        wp.launch(
+            kernel=compute_particle_conservative_bound,
+            inputs=[
+                self.particle_conservative_bound_relaxation,
+                self.particle_self_contact_margin,
+                self.particle_adjacency,
+                self.trimesh_collision_detector.collision_info,
+            ],
+            outputs=[
+                self.particle_conservative_bounds,
+            ],
+            dim=self.model.particle_count,
+            device=self.device,
+        )
+
+    
+    # called on init(1 time) and solve(iteration times)
+    def collision_detection_penetration_free_log_collision(self, current_state: State, iter_num=-2):
+        self.trimesh_collision_detector.refit(current_state.particle_q)
+        self.trimesh_collision_detector.vertex_triangle_collision_detection(
+            self.particle_self_contact_margin,
+            min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
+            min_distance_filtering_ref_pos=self.particle_q_rest,
+        )
+        data_collector.record_to_iteration("cloth_self_vt_col_count", self.trimesh_collision_detector.vertex_colliding_triangles_count.numpy().sum(), iter_num)
+        self.trimesh_collision_detector.edge_edge_collision_detection(
+            self.particle_self_contact_margin,
+            min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
+            min_distance_filtering_ref_pos=self.particle_q_rest,
+        )
+        data_collector.record_to_iteration("cloth_self_ee_col_count", self.trimesh_collision_detector.edge_colliding_edges_count.numpy().sum(), iter_num)
 
         self.pos_prev_collision_detection.assign(current_state.particle_q)
         wp.launch(

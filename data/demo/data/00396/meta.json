@@ -1,0 +1,107 @@
+{
+    "human": {
+        "scale": 10,
+        "gender": "male",
+        "fps": 30,
+        "frame_start": 1,
+        "motion_path": "human/114/114_07_poses.pkl",
+        "betas": [
+            0.09598314762115479,
+            0.9216049313545227,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ],
+        "seq_start": 0,
+        "seq_end": 405,
+        "collision": {
+            "friction": 65
+        }
+    },
+    "garment": [
+        {
+            "scale": 0.1,
+            "name": "tee_sleeveless",
+            "mesh_path": "tee_sleeveless_1800/tee_sleeveless_AZGOZQYXNY/tee_sleeveless_AZGOZQYXNY_sim.obj",
+            "cloth": {
+                "tension_stiffness": 27,
+                "compression_stiffness": 27,
+                "shear_stiffness": 27,
+                "bending_stiffness": 94,
+                "self_friction": 57,
+                "mass": 0.29952676636909914
+            },
+            "collision": {
+                "friction": 57
+            }
+        },
+        {
+            "scale": 0.1,
+            "name": "jacket",
+            "mesh_path": "jacket_2200/jacket_ISDC8W65T8/jacket_ISDC8W65T8_sim.obj",
+            "cloth": {
+                "tension_stiffness": 20,
+                "compression_stiffness": 20,
+                "shear_stiffness": 20,
+                "bending_stiffness": 52,
+                "self_friction": 68,
+                "mass": 0.40739964803243983
+            },
+            "collision": {
+                "friction": 68
+            }
+        }
+    ],
+    "wind": [
+        {
+            "name": "Wind_0",
+            "pivot_list": [
+                {
+                    "frame_start": 31,
+                    "rotation_quaternion": [
+                        0.00091984788376171,
+                        0.0005729121793455408,
+                        -0.5286756430121056,
+                        -0.8488232384526487
+                    ],
+                    "strength": 384.41224781796143
+                },
+                {
+                    "frame_start": 301,
+                    "rotation_quaternion": [
+                        0.08615455918240172,
+                        0.1315067736326606,
+                        -0.8260737425503509,
+                        -0.5411889986776068
+                    ],
+                    "strength": 21.1448273826357
+                },
+                {
+                    "frame_start": 361,
+                    "rotation_quaternion": [
+                        0.004182584758097239,
+                        0.08376439844273395,
+                        0.9952368810465838,
+                        0.049694890511360945
+                    ],
+                    "strength": 138.37302273466184
+                },
+                {
+                    "frame_start": 391,
+                    "rotation_quaternion": [
+                        0.7390334482578922,
+                        0.6392371649531668,
+                        -0.1390920297185933,
+                        -0.160806767791188
+                    ],
+                    "strength": 12.429193600147093
+                }
+            ]
+        }
+    ]
+}

@@ -3805,7 +3805,7 @@ class ModelBuilder:
         self.shape_flags.append(shape_flags)
         self.shape_type.append(type)
         self.shape_scale.append((scale[0], scale[1], scale[2]))
-        self.shape_source.append(src)
+        self.shape_source.append(src) # add mesh
         self.shape_thickness.append(cfg.thickness)
         self.shape_is_solid.append(cfg.is_solid)
         self.shape_material_ke.append(cfg.ke)
@@ -5427,6 +5427,7 @@ class ModelBuilder:
 
             The mesh should be two manifold.
         """
+
         tri_ke = tri_ke if tri_ke is not None else self.default_tri_ke
         tri_ka = tri_ka if tri_ka is not None else self.default_tri_ka
         tri_kd = tri_kd if tri_kd is not None else self.default_tri_kd

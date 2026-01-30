@@ -113,6 +113,10 @@ class State:
         self.joint_qd: wp.array | None = None
         """Generalized joint velocity coordinates, shape (joint_dof_count,), dtype float."""
 
+
+        self.smpl_q: wp.array | None = None
+        self.smpl_qd: wp.array | None = None
+
     def clear_forces(self) -> None:
         """
         Clear all force arrays (for particles and bodies) in the state object.

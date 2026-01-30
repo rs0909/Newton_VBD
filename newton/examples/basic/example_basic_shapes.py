@@ -131,6 +131,7 @@ class Example:
 
         self.viewer.set_model(self.model)
 
+        self.simulate()
         self.capture()
 
     def capture(self):

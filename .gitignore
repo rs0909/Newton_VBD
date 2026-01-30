@@ -53,3 +53,10 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+
+*.csv
+*.parquet
+
+.venv
+
+.DS_*

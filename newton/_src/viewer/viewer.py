@@ -318,7 +318,7 @@ class ViewerBase:
 
             self.log_instances(
                 shapes.name,
-                shapes.mesh,
+                shapes.mesh, # yk: this is mesh_path! not a wp.Mesh type!
                 shapes.world_xforms,
                 shapes.scales,  # Always pass scales - needed for transform matrix calculation
                 shapes.colors if self.model_changed or shapes.colors_changed else None,
@@ -394,6 +394,7 @@ class ViewerBase:
 
         # Get contact count (handle case where it might be zero)
         num_contacts = contacts.rigid_contact_count.numpy()[0]
+        # data_collector.record_to_frame("col_count", num_contacts)
         max_contacts = contacts.rigid_contact_max
 
         # Ensure we have buffers for line endpoints

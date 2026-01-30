@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from newton import data_collector
+
 import ctypes
 import time
 
@@ -1276,9 +1278,12 @@ class ViewerGL(ViewerBase):
                 imgui.text(f"Shapes: {self.model.shape_count}")
                 imgui.text(f"Joints: {self.model.joint_count}")
                 imgui.text(f"Particles: {self.model.particle_count}")
+                data_collector.record_to_scene("num_vert", self.model.particle_count)
                 imgui.text(f"Springs: {self.model.spring_count}")
                 imgui.text(f"Triangles: {self.model.tri_count}")
+                data_collector.record_to_scene("num_tri", self.model.tri_count)
                 imgui.text(f"Edges: {self.model.edge_count}")
+                data_collector.record_to_scene("num_edge", self.model.edge_count)
                 imgui.text(f"Tetrahedra: {self.model.tet_count}")
 
             # Rendered objects count

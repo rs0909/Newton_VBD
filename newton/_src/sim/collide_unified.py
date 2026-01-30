@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from newton import data_collector
+import time
+
 from enum import IntEnum
 
 import warp as wp
@@ -532,6 +535,8 @@ class CollisionPipelineUnified:
         self.broad_phase_pair_count.zero_()
 
         # Compute AABBs for all shapes (already expanded by per-shape contact margins)
+        # broad_time_start = time.perf_counter()
+        data_collector.broad_timer.clear_start()
         wp.launch(
             kernel=compute_shape_aabbs,
             dim=model.shape_count,
@@ -588,8 +593,13 @@ class CollisionPipelineUnified:
                 self.broad_phase_pair_count,
                 device=self.device,
             )
+        # broad_time_end = time.perf_counter()
+        data_collector.broad_timer.stop()
+        data_collector.record_to_frame("broad_time", data_collector.broad_timer.acc_time)
 
         # Prepare geometry data arrays for NarrowPhase API
+        # narrow_time_start = time.perf_counter()
+        data_collector.narrow_timer.clear_start()
         wp.launch(
             kernel=prepare_geom_data_kernel,
             dim=model.shape_count,
@@ -645,6 +655,9 @@ class CollisionPipelineUnified:
             writer_data=writer_data,
             device=self.device,
         )
+        # narrow_time_end = time.perf_counter()
+        data_collector.narrow_timer.stop()
+        data_collector.record_to_frame("narrow_time", data_collector.narrow_timer.acc_time)
 
         # Generate soft contacts for particles and shapes
         particle_count = len(state.particle_q) if state.particle_q else 0

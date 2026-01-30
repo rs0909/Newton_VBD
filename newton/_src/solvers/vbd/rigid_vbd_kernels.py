@@ -798,6 +798,194 @@ def evaluate_body_particle_contact(
 
     return body_contact_force, body_contact_hessian
 
+@wp.func
+def build_orthonormal_basis(n: wp.vec3):
+    """
+    Builds an orthonormal basis given a normal vector `n`. Return the two axes that is perpendicular to `n`.
+
+    :param n: A 3D vector (list or array-like) representing the normal vector
+    """
+    b1 = wp.vec3()
+    b2 = wp.vec3()
+    if n[2] < 0.0:
+        a = 1.0 / (1.0 - n[2])
+        b = n[0] * n[1] * a
+        b1[0] = 1.0 - n[0] * n[0] * a
+        b1[1] = -b
+        b1[2] = n[0]
+
+        b2[0] = b
+        b2[1] = n[1] * n[1] * a - 1.0
+        b2[2] = -n[1]
+    else:
+        a = 1.0 / (1.0 + n[2])
+        b = -n[0] * n[1] * a
+        b1[0] = 1.0 - n[0] * n[0] * a
+        b1[1] = b
+        b1[2] = -n[0]
+
+        b2[0] = b
+        b2[1] = 1.0 - n[1] * n[1] * a
+        b2[2] = -n[1]
+
+    return b1, b2
+
+
+@wp.func
+def evaluate_body_particle_contact_log_collision(
+    particle_index: int,
+    particle_pos: wp.vec3,
+    particle_prev_pos: wp.vec3,
+    contact_index: int,
+    body_particle_contact_ke: float,
+    body_particle_contact_kd: float,
+    friction_mu: float,
+    friction_epsilon: float,
+    particle_radius: wp.array(dtype=float),
+    shape_material_mu: wp.array(dtype=float),
+    shape_body: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    body_q_prev: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    body_com: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    contact_body_pos: wp.array(dtype=wp.vec3),
+    contact_body_vel: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    dt: float,
+):
+    """
+    Evaluate particle-rigid body contact force and Hessian (on particle side).
+
+    Computes contact forces and Hessians for a particle interacting with a rigid body shape.
+    The function is agnostic to whether the rigid body is static, kinematic, or dynamic.
+
+    Contact model:
+    - Normal: Linear spring-damper (stiffness: body_particle_contact_ke, damping: body_particle_contact_kd)
+    - Friction: 3D projector-based Coulomb friction with IPC regularization
+    - Normal direction: Points from rigid surface towards particle (into particle)
+
+    Args:
+        particle_index: Index of the particle
+        particle_pos: Current particle position (world frame)
+        particle_prev_pos: Previous particle position (world frame) used as the
+            "previous" position for finite-difference contact-relative velocity.
+        contact_index: Index in the body-particle contact arrays
+        body_particle_contact_ke: Contact stiffness (model-level or AVBD adaptive)
+        body_particle_contact_kd: Contact damping (model-level or AVBD averaged)
+        friction_mu: Friction coefficient (model-level or AVBD averaged)
+        friction_epsilon: Friction regularization distance
+        particle_radius: Array of particle radii
+        shape_material_mu: Array of shape friction coefficients
+        shape_body: Array mapping shape index to body index
+        body_q: Current body transforms
+        body_q_prev: Previous body transforms (for finite-difference body
+            velocity when available)
+        body_qd: Body spatial velocities (fallback when no previous pose is provided)
+        body_com: Body centers of mass (local frame)
+        contact_shape: Array of shape indices for each soft contact
+        contact_body_pos: Array of contact points (local to shape)
+        contact_body_vel: Array of contact velocities (local frame)
+        contact_normal: Array of contact normals (world frame, from rigid to particle)
+        dt: Time window [s] used for finite-difference damping/friction.
+
+    Returns:
+        tuple[wp.vec3, wp.mat33]: (force, Hessian) on the particle (world frame)
+    """
+    shape_index = contact_shape[contact_index]
+    body_index = shape_body[shape_index]
+
+    X_wb = wp.transform_identity()
+    X_com = wp.vec3()
+    if body_index >= 0:
+        X_wb = body_q[body_index]
+        X_com = body_com[body_index]
+
+    # body position in world space
+    bx = wp.transform_point(X_wb, contact_body_pos[contact_index])
+
+    n = contact_normal[contact_index]
+    T, B = build_orthonormal_basis(n)
+
+    penetration_depth = -(wp.dot(n, particle_pos - bx) - particle_radius[particle_index])
+    if penetration_depth > 0.0:
+        body_contact_force_norm = penetration_depth * body_particle_contact_ke
+        body_contact_force = n * body_contact_force_norm
+        body_contact_hessian = body_particle_contact_ke * wp.outer(n, n)
+
+        # Use the larger of body-particle friction and shape material friction
+        mu = wp.max(friction_mu, shape_material_mu[shape_index])
+
+        dx = particle_pos - particle_prev_pos
+
+        if wp.dot(n, dx) < 0.0:
+            # Damping coefficient is scaled by contact stiffness (consistent with rigid-rigid)
+            damping_coeff = body_particle_contact_kd * body_particle_contact_ke
+            damping_hessian = (damping_coeff / dt) * wp.outer(n, n)
+            body_contact_hessian = body_contact_hessian + damping_hessian
+            body_contact_force = body_contact_force - damping_hessian * dx
+
+        # body velocity
+        if body_q_prev:
+            # if body_q_prev is available, compute velocity using finite difference method
+            # this is more accurate for simulating static friction
+            X_wb_prev = wp.transform_identity()
+            if body_index >= 0:
+                X_wb_prev = body_q_prev[body_index]
+            bx_prev = wp.transform_point(X_wb_prev, contact_body_pos[contact_index])
+            bv = (bx - bx_prev) / dt + wp.transform_vector(X_wb, contact_body_vel[contact_index])
+
+        else:
+            # otherwise use the instantaneous velocity
+            r = bx - wp.transform_point(X_wb, X_com)
+            body_v_s = wp.spatial_vector()
+            if body_index >= 0:
+                body_v_s = body_qd[body_index]
+
+            body_w = wp.spatial_bottom(body_v_s)
+            body_v = wp.spatial_top(body_v_s)
+
+            # compute the body velocity at the particle position
+            bv = body_v + wp.cross(body_w, r) + wp.transform_vector(X_wb, contact_body_vel[contact_index])
+
+        relative_translation = dx - bv * dt # u_slip 
+
+        # Friction using 3D projector approach (consistent with rigid-rigid contacts)
+        eps_u = friction_epsilon * dt
+        friction_force, friction_hessian, u_norm = compute_projected_isotropic_friction_log_collision(
+            mu, body_contact_force_norm, n, relative_translation, eps_u
+        )
+        body_contact_force = body_contact_force + friction_force
+        body_contact_hessian = body_contact_hessian + friction_hessian
+    else:
+        body_contact_force = wp.vec3(0.0, 0.0, 0.0)
+        body_contact_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        friction_force = wp.vec3(0.0, 0.0, 0.0)
+        mu = 0.0
+
+    # T = wp.vec3(0.0,0.0,0.0)
+    # B = wp.vec3(0.0,0.0,0.0)
+    empty = wp.vec3(0.0,0.0,0.0)
+
+    return (body_contact_force, body_contact_hessian,
+            T,
+            B,
+            n,
+            u_norm,
+            eps_u,
+            friction_force,
+            
+            body_contact_force,
+            empty,
+            empty,
+            empty,
+            friction_force,
+            empty,
+            empty,
+            empty,
+            mu
+            )
+
 
 @wp.func
 def compute_projected_isotropic_friction(
@@ -842,6 +1030,50 @@ def compute_projected_isotropic_friction(
         K = wp.mat33(0.0)
 
     return f, K
+
+@wp.func
+def compute_projected_isotropic_friction_log_collision(
+    friction_mu: float,
+    normal_load: float,
+    n_hat: wp.vec3,
+    slip_u: wp.vec3,
+    eps_u: float,
+) -> tuple[wp.vec3, wp.mat33, float]:
+    """Isotropic Coulomb friction in world frame using projector P = I - n n^T.
+
+    Regularization: if ||u_t|| <= eps_u, uses a linear ramp; otherwise 1/||u_t||.
+
+    Args:
+        friction_mu: Coulomb friction coefficient (>= 0).
+        normal_load: Normal load magnitude (>= 0).
+        n_hat: Unit contact normal (world frame).
+        slip_u: Tangential slip displacement over dt (world frame).
+        eps_u: Smoothing distance (same units as slip_u, > 0).
+
+    Returns:
+        tuple[wp.vec3, wp.mat33]: (force, Hessian) in world frame.
+    """
+    # Tangential slip in the contact tangent plane without forming P: u_t = u - n * (n dot u)
+    dot_nu = wp.dot(n_hat, slip_u)
+    u_t = slip_u - n_hat * dot_nu
+    u_norm = wp.length(u_t)
+
+    if u_norm > 0.0:
+        # IPC-style regularization
+        if u_norm > eps_u:
+            f1_SF_over_x = 1.0 / u_norm
+        else:
+            f1_SF_over_x = (-u_norm / eps_u + 2.0) / eps_u
+
+        # Factor common scalar; force aligned with u_t, Hessian proportional to projector
+        scale = friction_mu * normal_load * f1_SF_over_x
+        f = -(scale * u_t)
+        K = scale * (wp.identity(3, float) - wp.outer(n_hat, n_hat))
+    else:
+        f = wp.vec3(0.0)
+        K = wp.mat33(0.0)
+
+    return f, K, u_norm
 
 
 @wp.func

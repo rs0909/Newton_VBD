@@ -233,6 +233,7 @@ class Example:
         self.viewer.set_model(self.model)
 
         # put graph capture into it's own function
+        self.simulate()
         self.capture()
 
     def capture(self):
