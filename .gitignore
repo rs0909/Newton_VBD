@@ -56,7 +56,8 @@ docs/_static/viser/
 
 *.csv
 *.parquet
-t rm -r --cached outputs data runs results logs checkpoints weights models wandb .cache 2>/dev/null || true
+*.pkl
 .venv
+data/
 
 .DS_*
