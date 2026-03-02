@@ -23,6 +23,8 @@ from ...geometry.kernels import (
     init_triangle_collision_data_kernel,
     triangle_triangle_collision_detection_kernel,
     vertex_triangle_collision_detection_kernel,
+    vertex_triangle_collision_detection_ogc_kernel,
+    edge_colliding_edges_detection_ogc_kernel,
 )
 from ...sim import Model
 
@@ -103,6 +105,10 @@ class TriMeshCollisionDetector:
     def __init__(
         self,
         model: Model,
+        v_adj_edges: wp.array(dtype=int),
+        v_adj_edges_offsets: wp.array(dtype=int),
+        v_adj_faces: wp.array(dtype=int),
+        v_adj_faces_offsets: wp.array(dtype=int),
         record_triangle_contacting_vertices=False,
         vertex_positions=None,
         vertex_collision_buffer_pre_alloc=8,
@@ -121,6 +127,12 @@ class TriMeshCollisionDetector:
         collision_detection_block_size=16,
     ):
         self.model = model
+
+        self.v_adj_edges = v_adj_edges
+        self.v_adj_edges_offsets = v_adj_edges_offsets
+        self.v_adj_faces = v_adj_faces
+        self.v_adj_faces_offsets = v_adj_faces_offsets
+
         self.record_triangle_contacting_vertices = record_triangle_contacting_vertices
         self.vertex_positions = model.particle_q if vertex_positions is None else vertex_positions
         self.device = model.device
@@ -396,6 +408,64 @@ class TriMeshCollisionDetector:
             block_dim=self.collision_detection_block_size,
         )
 
+    def vertex_triangle_collision_detection_ogc(
+        self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
+    ):
+        self.vertex_colliding_triangles.fill_(-1)
+
+        if self.record_triangle_contacting_vertices:
+            wp.launch(
+                kernel=init_triangle_collision_data_kernel,
+                inputs=[
+                    max_query_radius,
+                ],
+                outputs=[
+                    self.triangle_colliding_vertices_count,
+                    self.triangle_colliding_vertices_min_dist,
+                    self.resize_flags,
+                ],
+                dim=self.model.tri_count,
+                device=self.model.device,
+            )
+        else:
+            self.triangle_colliding_vertices_min_dist.fill_(max_query_radius)
+
+        wp.launch(
+            kernel=vertex_triangle_collision_detection_ogc_kernel,
+            inputs=[
+                max_query_radius,
+                min_query_radius,
+                self.bvh_tris.id,
+                self.vertex_positions,
+                self.model.tri_indices,
+                self.model.edge_indices,
+                self.vertex_colliding_triangles_offsets,
+                self.vertex_colliding_triangles_buffer_sizes,
+                self.triangle_colliding_vertices_offsets,
+                self.triangle_colliding_vertices_buffer_sizes,
+                self.vertex_triangle_filtering_list,
+                self.vertex_triangle_filtering_list_offsets,
+                min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
+                
+                self.v_adj_edges,
+                self.v_adj_edges_offsets,
+                self.v_adj_faces,
+                self.v_adj_faces_offsets,
+            ],
+            outputs=[
+                self.vertex_colliding_triangles,
+                self.vertex_colliding_triangles_count,
+                self.vertex_colliding_triangles_min_dist,
+                self.triangle_colliding_vertices,
+                self.triangle_colliding_vertices_count,
+                self.triangle_colliding_vertices_min_dist,
+                self.resize_flags,
+            ],
+            dim=self.model.particle_count,
+            device=self.model.device,
+            block_dim=self.collision_detection_block_size,
+        )
+
     def edge_edge_collision_detection(
         self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
     ):
@@ -414,6 +484,40 @@ class TriMeshCollisionDetector:
                 self.edge_filtering_list,
                 self.edge_filtering_list_offsets,
                 min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
+            ],
+            outputs=[
+                self.edge_colliding_edges,
+                self.edge_colliding_edges_count,
+                self.edge_colliding_edges_min_dist,
+                self.resize_flags,
+            ],
+            dim=self.model.edge_count,
+            device=self.model.device,
+            block_dim=self.collision_detection_block_size,
+        )
+
+    def edge_edge_collision_detection_ogc(
+        self, max_query_radius, min_query_radius=0.0, min_distance_filtering_ref_pos=None
+    ):
+        self.edge_colliding_edges.fill_(-1)
+        wp.launch(
+            kernel=edge_colliding_edges_detection_ogc_kernel,
+            inputs=[
+                max_query_radius,
+                min_query_radius,
+                self.bvh_edges.id,
+                self.vertex_positions,
+                self.model.tri_indices,
+                self.model.edge_indices,
+                self.edge_colliding_edges_offsets,
+                self.edge_colliding_edges_buffer_sizes,
+                self.edge_edge_parallel_epsilon,
+                self.edge_filtering_list,
+                self.edge_filtering_list_offsets,
+                min_distance_filtering_ref_pos if min_distance_filtering_ref_pos is not None else self.vertex_positions,
+
+                self.v_adj_faces,
+                self.v_adj_faces_offsets,
             ],
             outputs=[
                 self.edge_colliding_edges,

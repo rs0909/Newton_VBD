@@ -266,6 +266,16 @@ class ViewerGL(ViewerBase):
         self.objects[name].hidden = hidden
         self.objects[name].backface_culling = backface_culling
 
+    def update_mesh(
+        self, 
+        name, 
+        points: wp.array,
+        indices: wp.array,
+        normals: wp.array | None = None,
+        uvs: wp.array | None = None,
+    ):
+        self.objects[name].update(points, indices, normals, uvs)
+
     @override
     def log_instances(self, name, mesh, xforms, scales, colors, materials, hidden=False):
         """
@@ -292,6 +302,7 @@ class ViewerGL(ViewerBase):
         resized = False
 
         if instancer is None:
+            print(f"No instance found. Create new one, {name}")
             capacity = max(transform_count, 1)
             instancer = MeshInstancerGL(capacity, self.objects[mesh])
             self.objects[name] = instancer
@@ -365,7 +376,7 @@ class ViewerGL(ViewerBase):
             self.lines[name] = LinesGL(max_lines, self.device, hidden=hidden)
 
         self.lines[name].update(starts, ends, colors)
-
+    
     @override
     def log_points(self, name, points, radii, colors, hidden=False):
         """
@@ -1289,6 +1300,7 @@ class ViewerGL(ViewerBase):
             # Rendered objects count
             imgui.separator()
             imgui.text(f"Unique Objects: {len(self.objects)}")
+            # print(self.objects)
 
         # Custom stats
         for callback in self._ui_callbacks["stats"]:

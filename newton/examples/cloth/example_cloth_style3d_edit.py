@@ -23,6 +23,26 @@ import newton.usd
 import newton.utils
 from newton import Mesh, ParticleFlags
 
+def scale_points(points: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    """Compute center of mass, scale points around it, and return.
+    
+    Args:
+        points: Array of shape (n, 3) or (3n,) representing particle positions.
+        scale: Scaling factor to apply around center of mass.
+    
+    Returns:
+        Scaled points centered at the original center of mass.
+    """
+    points = points.reshape(-1, 3)
+    
+    # Compute center of mass
+    com = np.mean(points, axis=0)
+    
+    # Translate by negative COM, scale, translate back
+    scaled_points = (points - com) * scale + com
+    
+    return scaled_points
+
 
 class Example:
     def __init__(self, viewer, args=None):
@@ -38,7 +58,8 @@ class Example:
         self.iterations = 4
 
         self.viewer = viewer
-        builder = newton.ModelBuilder(gravity=-9.8)
+        builder = newton.ModelBuilder(gravity=-9.81)
+        # builder = newton.Style3DModelBuilder(up_axis=newton.Axis.Z)
 
         use_cloth_mesh = True
         if use_cloth_mesh:
@@ -67,6 +88,9 @@ class Example:
             avatar_mesh = newton.usd.get_mesh(usd_prim_avatar)
             avatar_mesh_indices = avatar_mesh.indices
             avatar_mesh_points = avatar_mesh.vertices
+
+            sf = 4.5
+            sfv = wp.vec3(sf, sf, sf)
             
             combined_quat = wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0) * wp.quat_from_axis_angle(axis=wp.vec3(0,1,0), angle=wp.pi/2.0)
             print(len(garment_mesh_points), "<<<<<<<<<<<< number of points")
@@ -81,16 +105,46 @@ class Example:
                 edge_kd=1e-4,
                 vertices=garment_mesh_points.tolist(),
                 indices=garment_mesh_indices.tolist(),
-                density=0.3,
-                scale=4.0,
+                density=0.2,
+                scale=sf,
             )
+
+            garment_usd_name = "Female_T_Shirt"
+
+            usd_stage = Usd.Stage.Open(str(asset_path / "garments" / (garment_usd_name + ".usd")))
+            usd_prim_garment = usd_stage.GetPrimAtPath(str("/Root/" + garment_usd_name + "/Root_Garment"))
+
+            garment_mesh = newton.usd.get_mesh(usd_prim_garment, load_uvs=True)
+            garment_mesh_indices = garment_mesh.indices
+            garment_mesh_points = scale_points(garment_mesh.vertices, 1.35)
+
+            garment_mesh_uv = garment_mesh.uvs * 1e-3
+
+            garment_prim = UsdGeom.PrimvarsAPI(usd_prim_garment).GetPrimvar("st")
+            garment_mesh_uv_indices = np.array(garment_prim.GetIndices())
+
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0, 0, -0.05*sf),
+                rot=combined_quat,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                tri_ke=1.0e3,
+                tri_ka=1.0e3,
+                tri_kd=2.0e-7,
+                edge_ke=1e-3,
+                edge_kd=1e-4,
+                vertices=garment_mesh_points.tolist(),
+                indices=garment_mesh_indices.tolist(),
+                density=0.2,
+                scale=sf,
+            )
+
             builder.add_shape_mesh(
                 body=builder.add_body(),
                 xform=wp.transform(
                     p=wp.vec3(0, 0, 0),
                     q=combined_quat,
                 ),
-                scale=wp.vec3(4.0,4.0,4.0),
+                scale=sfv,
                 mesh=Mesh(avatar_mesh_points, avatar_mesh_indices),
             )
             # fixed_points = [0]
@@ -132,7 +186,7 @@ class Example:
         self.model.soft_contact_ke = 1.0e1
         self.model.soft_contact_kd = 1.0e-6
         self.model.soft_contact_mu = 0.2
-        self.model.set_gravity((0.0, 0.0, -9.81))
+        # self.model.set_gravity((0.0, 0.0, -9.81))
 
         self.solver = newton.solvers.SolverVBD(
             self.model,

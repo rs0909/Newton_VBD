@@ -24,8 +24,15 @@ def is_log_collision():
 #
 # reocrd frame count setting
 #
-record_frame_count = 100
+backup_frame = 100
+record_frame_count = 300
+export_collision_csv = False
 
+record_name = 'data'
+
+def set_record_name(name):
+    global record_name
+    record_name = name
 
 
 ##############
@@ -56,9 +63,11 @@ def export_scene_dict_to_csv(filepath="scene_data.csv"):
     if not scene_dict:
         print("scene_dict is empty. Nothing to export.")
         return
+
+    global record_name
     
     try:
-        with open(filepath, "w", newline="") as csvfile:
+        with open(record_name + '_' + filepath, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             
             # Write header and values
@@ -106,8 +115,10 @@ def export_frame_dict_to_csv(filepath="frame_data.csv"):
         print("frame_dict is empty. Nothing to export.")
         return
     
+    global record_name
+
     try:
-        with open(filepath, "w", newline="") as csvfile:
+        with open(record_name + '_' + filepath, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             
             # Write header
@@ -147,8 +158,10 @@ def export_iteration_dict_to_csv(filepath="iteration_data.csv"):
         print("iteration_dict is empty. Nothing to export.")
         return
     
+    global record_name
+
     try:
-        with open(filepath, "w", newline="") as csvfile:
+        with open(record_name + '_' + filepath, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             
             # Write header
@@ -208,8 +221,10 @@ def export_collision_dict_to_parquet(filepath="collision_data.parquet"):
             print("⚠ No collisions found. Skipped saving.")
             return
         
+        global record_name
+
         print("Let's save!")
-        df.to_parquet(filepath, index=False)
+        df.to_parquet(record_name + '_' + filepath, index=False)
         print(f"✅ Exported {len(df)} rows to {filepath}")
         
     except Exception as e:
@@ -234,8 +249,10 @@ def export_collision_dict_to_csv(filepath="collision_data.csv"):
             print("⚠ No collisions found. Skipped saving.")
             return
         
+        global record_name
+        
         print("Let's save!")
-        df.to_csv(filepath, index=False)
+        df.to_csv(record_name + '_' + filepath, index=False)
         print(f"✅ Exported {len(df)} rows to {filepath}")
         
     except Exception as e:
@@ -265,9 +282,11 @@ def export_collision_per_v_dict_to_csv(filepath="collision_per_v_data.csv"):
         if df.empty:
             print("⚠ No collision per-vertex data found. Skipped saving.")
             return
+
+        global record_name
         
         print("Let's save!")
-        df.to_csv(filepath, index=False)
+        df.to_csv(record_name + '_' + filepath, index=False)
         print(f"✅ Exported {len(df)} rows to {filepath}")
         
     except Exception as e:
@@ -293,8 +312,10 @@ def export_collision_per_v_dict_to_parquet(filepath="collision_per_v_data.parque
             print("⚠ No collision per-vertex data found. Skipped saving.")
             return
         
+        global record_name
+        
         print("Let's save!")
-        df.to_parquet(filepath, index=False)
+        df.to_parquet(record_name + '_' + filepath, index=False)
         print(f"✅ Exported {len(df)} rows to {filepath}")
         
     except Exception as e:
@@ -316,18 +337,21 @@ def frame_start(frame):
     global record_frame_finished
     global export_needed
 
-    if frame > 0 and frame % 10 == 0:
-        export_needed = True
+    if is_log_collision():
+        if frame > 0 and frame % backup_frame == 0:
+            export_needed = True
+    
 
     if export_needed:
-        export_scene_dict_to_csv("scene_data.csv")
         if log_mode == LOG_PERFORMANCE:
+            export_scene_dict_to_csv("scene_data.csv")
             export_frame_dict_to_csv("frame_data.csv")
             export_iteration_dict_to_csv("iteration_data.csv")
         elif log_mode == LOG_COLLISION_INFO:
-            # export_collision_dict_to_csv("collision_data.csv")
+            if export_collision_csv:
+                export_collision_dict_to_csv(f"collision_data_{frame}.csv")
+                export_collision_per_v_dict_to_csv(f"collision_per_v_data_{frame}.csv")
             export_collision_dict_to_parquet(f"collision_data_{frame}.parquet")
-            # export_collision_per_v_dict_to_csv("collision_per_v_data.csv")
             export_collision_per_v_dict_to_parquet(f"collision_per_v_data_{frame}.parquet")
             collision_dict.clear()
             collision_per_v_dict.clear()
@@ -442,8 +466,9 @@ def record_to_iteration(key, value, iter_num):
 def record_to_collision_per_v(frame, substep, iter_num, contact_idx,
                                 vert_id,
                                 is_vert, is_facet, is_edge,
-                                normal_contact_force_x, normal_contact_force_y, normal_contact_force_z,
-                                friction_x, friction_y, friction_z, mu):
+                                normal_contact_force,
+                                friction,
+                                mu):
     collision_per_v_dict["frame_idx"].append(frame)
     collision_per_v_dict["substep_idx"].append(substep)
     collision_per_v_dict["iter_num"].append(iter_num)
@@ -453,12 +478,12 @@ def record_to_collision_per_v(frame, substep, iter_num, contact_idx,
     collision_per_v_dict["is_vert"].append(is_vert)
     collision_per_v_dict["is_facet"].append(is_facet)
     collision_per_v_dict["is_edge"].append(is_edge)
-    collision_per_v_dict["normal_contact_force_x"].append(normal_contact_force_x)
-    collision_per_v_dict["normal_contact_force_y"].append(normal_contact_force_y)
-    collision_per_v_dict["normal_contact_force_z"].append(normal_contact_force_z)
-    collision_per_v_dict["friction_x"].append(friction_x)
-    collision_per_v_dict["friction_y"].append(friction_y)
-    collision_per_v_dict["friction_z"].append(friction_z)
+    collision_per_v_dict["normal_contact_force_x"].append(normal_contact_force[0])
+    collision_per_v_dict["normal_contact_force_y"].append(normal_contact_force[1])
+    collision_per_v_dict["normal_contact_force_z"].append(normal_contact_force[2])
+    collision_per_v_dict["friction_x"].append(friction[0])
+    collision_per_v_dict["friction_y"].append(friction[1])
+    collision_per_v_dict["friction_z"].append(friction[2])
     collision_per_v_dict["friction_mu"].append(mu)
 
 
@@ -470,37 +495,21 @@ def record_to_collision(iter_num,
                         is_self_col, is_body_cloth_col,
                         is_vt_col, is_ee_col,
                         vertex_id, facet_id, edge_id1, edge_id2,
-                        Tx, Ty, Tz, Bx, By, Bz, Nx, Ny, Nz, # tangent, bitanget, normal frame
+                        T, B, N, # tangent, bitanget, normal frame
                         u_norm, eps_u,
                         is_slip,
-                        normal_force_sum_x, normal_force_sum_y, normal_force_sum_z,
-                        normal_force_min_x, normal_force_min_y, normal_force_min_z,
-                        friction_x, friction_y, friction_z,
+                        normal_force_sum,
+                        normal_force_min,
+                        friction,
                         v_list,
-                        normal_contact_force0_x,
-                        normal_contact_force0_y,
-                        normal_contact_force0_z,
-                        normal_contact_force1_x,
-                        normal_contact_force1_y,
-                        normal_contact_force1_z,
-                        normal_contact_force2_x,
-                        normal_contact_force2_y,
-                        normal_contact_force2_z,
-                        normal_contact_force3_x,
-                        normal_contact_force3_y,
-                        normal_contact_force3_z,
-                        friction0_x,
-                        friction0_y,
-                        friction0_z,
-                        friction1_x,
-                        friction1_y,
-                        friction1_z,
-                        friction2_x,
-                        friction2_y,
-                        friction2_z,
-                        friction3_x,
-                        friction3_y,
-                        friction3_z,
+                        normal_contact_force0,
+                        normal_contact_force1,
+                        normal_contact_force2,
+                        normal_contact_force3,
+                        friction0,
+                        friction1,
+                        friction2,
+                        friction3,
                         mu
                         ):
     if is_log_nothing():
@@ -518,7 +527,7 @@ def record_to_collision(iter_num,
     substep = get_substep()
     
     for i in range(len(contact_idx)):
-        if friction_x[i] == 0 and friction_y[i] == 0 and friction_z[i] == 0: 
+        if friction[i][0] == 0 and friction[i][1] == 0 and friction[i][2] == 0: 
             continue # skip not important data
 
         # Append iteration number
@@ -543,29 +552,29 @@ def record_to_collision(iter_num,
 
 
         # Tangent, bitangent, normal vectors
-        collision_dict["Tx"].append(Tx[i])
-        collision_dict["Ty"].append(Ty[i])
-        collision_dict["Tz"].append(Tz[i])
-        collision_dict["Bx"].append(Bx[i])
-        collision_dict["By"].append(By[i])
-        collision_dict["Bz"].append(Bz[i])
-        collision_dict["Nx"].append(Nx[i])
-        collision_dict["Ny"].append(Ny[i])
-        collision_dict["Nz"].append(Nz[i])
+        collision_dict["Tx"].append(T[i][0])
+        collision_dict["Ty"].append(T[i][1])
+        collision_dict["Tz"].append(T[i][2])
+        collision_dict["Bx"].append(B[i][0])
+        collision_dict["By"].append(B[i][1])
+        collision_dict["Bz"].append(B[i][2])
+        collision_dict["Nx"].append(N[i][0])
+        collision_dict["Ny"].append(N[i][1])
+        collision_dict["Nz"].append(N[i][2])
         
         # Contact parameters
         collision_dict["u_norm"].append(u_norm[i])
         collision_dict["eps_u"].append(eps_u[i])
         collision_dict["is_slip"].append(is_slip[i])
-        collision_dict["normal_force_sum_x"].append(normal_force_sum_x[i])
-        collision_dict["normal_force_sum_y"].append(normal_force_sum_y[i])
-        collision_dict["normal_force_sum_z"].append(normal_force_sum_z[i])
-        collision_dict["normal_force_min_x"].append(normal_force_min_x[i])
-        collision_dict["normal_force_min_y"].append(normal_force_min_y[i])
-        collision_dict["normal_force_min_z"].append(normal_force_min_z[i])
-        collision_dict["friction_x"].append(friction_x[i])
-        collision_dict["friction_y"].append(friction_y[i])
-        collision_dict["friction_z"].append(friction_z[i])
+        collision_dict["normal_force_sum_x"].append(normal_force_sum[i][0])
+        collision_dict["normal_force_sum_y"].append(normal_force_sum[i][1])
+        collision_dict["normal_force_sum_z"].append(normal_force_sum[i][2])
+        collision_dict["normal_force_min_x"].append(normal_force_min[i][0])
+        collision_dict["normal_force_min_y"].append(normal_force_min[i][1])
+        collision_dict["normal_force_min_z"].append(normal_force_min[i][2])
+        collision_dict["friction_x"].append(friction[i][0])
+        collision_dict["friction_y"].append(friction[i][1])
+        collision_dict["friction_z"].append(friction[i][2])
         collision_dict["friction_mu"].append(mu[i])
 
         if is_vt_col[i]: # 4 friction data
@@ -574,52 +583,59 @@ def record_to_collision(iter_num,
                                     False, #is_vert, 
                                     True, #is_facet, 
                                     False, #is_edge,
-                                    normal_contact_force0_x[i], normal_contact_force0_y[i], normal_contact_force0_z[i],
-                                    friction0_x[i], friction0_y[i], friction0_z[i], mu[i])
+                                    normal_contact_force0[i],
+                                    friction0[i],
+                                    mu[i])
             record_to_collision_per_v(frame, substep, iter_num, contact_idx[i],
                                     v_list[i][1],
                                     False, #is_vert, 
                                     True, #is_facet, 
                                     False, #is_edge,
-                                    normal_contact_force1_x[i], normal_contact_force1_y[i], normal_contact_force1_z[i],
-                                    friction1_x[i], friction1_y[i], friction1_z[i], mu[i])
+                                    normal_contact_force1[i],
+                                    friction1[i],
+                                    mu[i])
             record_to_collision_per_v(frame, substep, iter_num, contact_idx[i],
                                     v_list[i][2],
                                     False, #is_vert, 
                                     True, #is_facet, 
                                     False, #is_edge,
-                                    normal_contact_force2_x[i], normal_contact_force2_y[i], normal_contact_force2_z[i],
-                                    friction2_x[i], friction2_y[i], friction2_z[i], mu[i])
+                                    normal_contact_force2[i],
+                                    friction2[i],
+                                    mu[i])
             record_to_collision_per_v(frame, substep, iter_num, contact_idx[i],
                                     v_list[i][3],
                                     True, #is_vert, 
                                     False, #is_facet, 
                                     False, #is_edge,
-                                    normal_contact_force3_x[i], normal_contact_force3_y[i], normal_contact_force3_z[i],
-                                    friction3_x[i], friction3_y[i], friction3_z[i], mu[i])
+                                    normal_contact_force3[i],
+                                    friction3[i],
+                                    mu[i])
         elif is_ee_col[i]:
             record_to_collision_per_v(frame, substep, iter_num, contact_idx[i],
                                     v_list[i][0],
                                     False, #is_vert, 
                                     False, #is_facet, 
                                     True, #is_edge,
-                                    normal_contact_force0_x[i], normal_contact_force0_y[i], normal_contact_force0_z[i],
-                                    friction0_x[i], friction0_y[i], friction0_z[i], mu[i])
+                                    normal_contact_force0[i],
+                                    friction0[i],
+                                    mu[i])
             record_to_collision_per_v(frame, substep, iter_num, contact_idx[i],
                                     v_list[i][1],
                                     False, #is_vert, 
                                     False, #is_facet, 
                                     True, #is_edge,
-                                    normal_contact_force1_x[i], normal_contact_force1_y[i], normal_contact_force1_z[i],
-                                    friction1_x[i], friction1_y[i], friction1_z[i], mu[i])
+                                    normal_contact_force1[i],
+                                    friction1[i],
+                                    mu[i])
         elif is_body_cloth_col[i]:
             record_to_collision_per_v(frame, substep, iter_num, contact_idx[i],
                                     v_list[i][0],
                                     True, #is_vert, 
                                     False, #is_facet, 
                                     False, #is_edge,
-                                    normal_contact_force0_x[i], normal_contact_force0_y[i], normal_contact_force0_z[i],
-                                    friction0_x[i], friction0_y[i], friction0_z[i], mu[i])
+                                    normal_contact_force0[i],
+                                    friction0[i],
+                                    mu[i])
         else:
             print("IDK what collision is, Stop recording")
             record_frame_finished = True

@@ -23,30 +23,14 @@ import newton.usd
 import newton.utils
 from newton import Mesh, ParticleFlags
 
-def scale_points(points: np.ndarray, scale: float = 1.0) -> np.ndarray:
-    """Compute center of mass, scale points around it, and return.
-    
-    Args:
-        points: Array of shape (n, 3) or (3n,) representing particle positions.
-        scale: Scaling factor to apply around center of mass.
-    
-    Returns:
-        Scaled points centered at the original center of mass.
-    """
-    points = points.reshape(-1, 3)
-    
-    # Compute center of mass
-    com = np.mean(points, axis=0)
-    
-    # Translate by negative COM, scale, translate back
-    scaled_points = (points - com) * scale + com
-    
-    return scaled_points
+
+from newton import Mesh, DynamicMesh
+
+from layers.datasets import LayersReader
 
 
 class Example:
     def __init__(self, viewer, args=None):
-        data_collector.set_record_name('MJ_2layerswithbody')
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -75,7 +59,7 @@ class Example:
 
             garment_mesh = newton.usd.get_mesh(usd_prim_garment, load_uvs=True)
             garment_mesh_indices = garment_mesh.indices
-            garment_mesh_points = scale_points(garment_mesh.vertices, 0.95)
+            garment_mesh_points = garment_mesh.vertices
             garment_mesh_uv = garment_mesh.uvs * 1e-3
 
             # Load UV indices separately (not part of Mesh class)
@@ -88,66 +72,37 @@ class Example:
             avatar_mesh = newton.usd.get_mesh(usd_prim_avatar)
             avatar_mesh_indices = avatar_mesh.indices
             avatar_mesh_points = avatar_mesh.vertices
+            
+            
+            self.layers_reader = LayersReader('/home/user/Desktop/newton/data/demo', '/home/user/Desktop/newton/data/smpl')
+            # self.sample_name = '00396'
+            # self.sample_name = '00023'
+            self.sample_name = '00041'
+            # self.sample_name = '00084'
+            # self.sample_name = '00119'
 
-            combined_quat = wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0) * wp.quat_from_axis_angle(axis=wp.vec3(0,1,0), angle=wp.pi/2.0)
-
-            # add layer 1
             builder.add_aniso_cloth_mesh(
                 pos=wp.vec3(0, 0, 0),
-                # rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
-                rot=combined_quat,
+                rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
                 vel=wp.vec3(0.0, 0.0, 0.0),
                 tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
                 edge_aniso_ke=wp.vec3(2.0e-5, 1.0e-5, 5.0e-6),
-                panel_verts=garment_mesh_uv.tolist(),
-                panel_indices=garment_mesh_uv_indices.tolist(),
+                panel_verts=None,
+                panel_indices=None,
                 vertices=garment_mesh_points.tolist(),
                 indices=garment_mesh_indices.tolist(),
                 density=0.3,
                 scale=1.0,
                 particle_radius=5.0e-3,
             )
-
-            # add layer 2 - need to adjust the size, slightly bigger.
-            garment_usd_name = "Female_T_Shirt"
-
-            usd_stage = Usd.Stage.Open(str(asset_path / "garments" / (garment_usd_name + ".usd")))
-            usd_prim_garment = usd_stage.GetPrimAtPath(str("/Root/" + garment_usd_name + "/Root_Garment"))
-
-            garment_mesh = newton.usd.get_mesh(usd_prim_garment, load_uvs=True)
-            garment_mesh_indices = garment_mesh.indices
-            garment_mesh_points = scale_points(garment_mesh.vertices, 1.2)
-
-            garment_mesh_uv = garment_mesh.uvs * 1e-3
-
-            garment_prim = UsdGeom.PrimvarsAPI(usd_prim_garment).GetPrimvar("st")
-            garment_mesh_uv_indices = np.array(garment_prim.GetIndices())
-
-            builder.add_aniso_cloth_mesh(
-                pos=wp.vec3(0, 0, -0.06),
-                # rot=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
-                rot=combined_quat,
-                vel=wp.vec3(0.0, 0.0, 0.0),
-                tri_aniso_ke=wp.vec3(1.0e2, 1.0e2, 1.0e1),
-                edge_aniso_ke=wp.vec3(2.0e-5, 1.0e-5, 5.0e-6),
-                panel_verts=garment_mesh_uv.tolist(),
-                panel_indices=garment_mesh_uv_indices.tolist(),
-                vertices=garment_mesh_points.tolist(),
-                indices=garment_mesh_indices.tolist(),
-                density=0.3,
-                scale=1.0,
-                particle_radius=5.0e-3,
-            )
-
-            # add body
-            builder.add_shape_mesh(
-                body=builder.add_body(),
-                xform=wp.transform(
-                    p=wp.vec3(0, 0, 0),
-                    q=combined_quat,
-                ),
-                mesh=Mesh(avatar_mesh_points, avatar_mesh_indices),
-            )
+            # builder.add_shape_mesh(
+            #     body=builder.add_body(),
+            #     xform=wp.transform(
+            #         p=wp.vec3(0, 0, 0),
+            #         q=wp.quat_from_axis_angle(axis=wp.vec3(1, 0, 0), angle=wp.pi / 2.0),
+            #     ),
+            #     mesh=Mesh(avatar_mesh_points, avatar_mesh_indices),
+            # )
             # fixed_points = [0]
             fixed_points = []
         else:
@@ -252,19 +207,6 @@ class Example:
 
 
 if __name__ == "__main__":
-    from newton import data_collector
-    import os, time
-
-    # 1) 로그 모드 켜기 (충돌 로깅이면)
-    data_collector.log_mode = 0  # 또는 LOG_PERFORMANCE
-
-    # 2) 저장 폴더 + run 이름 만들기
-    out_dir = "/home/user/Desktop/newton/newton/logs"
-    os.makedirs(out_dir, exist_ok=True)
-
-    run_name = f"{out_dir}/cloth5layer_{time.strftime('%Y%m%d_%H%M%S')}"
-    data_collector.set_record_name(run_name)
-
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init()
 

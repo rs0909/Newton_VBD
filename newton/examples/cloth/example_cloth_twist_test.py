@@ -37,6 +37,8 @@ import newton.examples
 import newton.usd
 from newton import ParticleFlags
 
+from .example_cloth_smpl_1layer0 import (debug_contact_points, check_particle_valid)
+
 
 @wp.kernel
 def initialize_rotation(
@@ -85,7 +87,7 @@ def apply_rotation(
     pos_1: wp.array(dtype=wp.vec3),
 ):
     cur_t = t[0]
-    if cur_t > end_time:
+    if cur_t > end_time*2.0:
         return
 
     tid = wp.tid()
@@ -97,7 +99,10 @@ def apply_rotation(
     uy = rot_axis[1]
     uz = rot_axis[2]
 
-    theta = cur_t * angular_velocity
+    if cur_t < end_time:
+        theta = cur_t * angular_velocity # 0 to end_time*angular_velocity
+    else:
+        theta = (end_time-(cur_t-end_time)) * angular_velocity
 
     R = wp.mat33(
         wp.cos(theta) + ux * ux * (1.0 - wp.cos(theta)),
@@ -195,7 +200,8 @@ class Example:
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
             particle_self_contact_margin=0.0035,
-            # ogc_contact=True
+            # particle_conservative_bound_relaxation=0.8
+            ogc_contact=True,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -234,8 +240,8 @@ class Example:
         self.viewer.set_model(self.model)
 
         # put graph capture into it's own function
-        self.simulate()
-        self.capture()
+        # self.simulate()
+        # self.capture()
 
     def capture(self):
         self.graph = None
@@ -274,14 +280,36 @@ class Example:
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
+
+            fixed_counter = wp.zeros(1, dtype=int, device=wp.get_device())
+            fixed_particle_positions = wp.empty(self.state_0.particle_count, dtype=wp.vec3, device=wp.get_device())
+                    
+            wp.launch(
+                kernel=check_particle_valid,
+                dim=self.state_0.particle_count,
+                inputs=[
+                    self.state_0.particle_q,
+                    self.model.particle_inv_mass,
+                    self.solver.particle_conservative_bounds,
+                    1e-4
+                ],
+                outputs=[
+                    fixed_counter,
+                    fixed_particle_positions
+                ]
+            )
+
+            fixed_num = fixed_counter.numpy()[0]
+            debug_contact_points('/debug/fixed_points', self.viewer, fixed_particle_positions.numpy()[:fixed_num], (1, 0, 0), 0.01)
+
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        if self.graph:
-            wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        # if self.graph:
+        #     wp.capture_launch(self.graph)
+        # else:
+        self.simulate()
 
         self.sim_time += self.frame_dt
 

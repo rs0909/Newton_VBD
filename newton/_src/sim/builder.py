@@ -5086,7 +5086,7 @@ class ModelBuilder:
                 np.array(tri_lift)[valid_inds],
                 strict=False,
             )
-        )
+        ) # now it is [0]: ke, ka, kd, drag, lift. and so on per each [index]
         areas = areas.tolist()
         self.tri_areas.extend(areas)
         return areas
@@ -6204,7 +6204,7 @@ class ModelBuilder:
             # build list of ids for geometry sources (meshes, sdfs)
             geo_sources = []
             finalized_meshes = {}  # do not duplicate meshes
-            for geo in self.shape_source:
+            for geo in self.shape_source: # yk: list of the Mesh (not a wp.Mesh)
                 geo_hash = hash(geo)  # avoid repeated hash computations
                 if geo:
                     if geo_hash not in finalized_meshes:

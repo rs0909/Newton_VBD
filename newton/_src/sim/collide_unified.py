@@ -612,8 +612,8 @@ class CollisionPipelineUnified:
                 state.body_q,
             ],
             outputs=[
-                self.geom_data,
-                self.geom_transform,
+                self.geom_data,      # scale 3vec + thickness 1
+                self.geom_transform, # world space transform
             ],
             device=self.device,
         )
@@ -656,11 +656,10 @@ class CollisionPipelineUnified:
             device=self.device,
         )
         # narrow_time_end = time.perf_counter()
-        data_collector.narrow_timer.stop()
-        data_collector.record_to_frame("narrow_time", data_collector.narrow_timer.acc_time)
 
         # Generate soft contacts for particles and shapes
         particle_count = len(state.particle_q) if state.particle_q else 0
+        # print(model.shape_source_ptr)
         if state.particle_q and model.shape_count > 0:
             wp.launch(
                 kernel=create_soft_contacts,
@@ -693,6 +692,12 @@ class CollisionPipelineUnified:
                 ],
                 device=self.device,
             )
+        # if contacts.soft_contact_count.numpy()[0]:
+            # print(f">>>>>>>>> {contacts.soft_contact_body_vel.numpy()[0]}")
+        # print(contacts.soft_contact_body_vel.numpy()[0])
+        data_collector.narrow_timer.stop()
+        data_collector.record_to_frame("narrow_time", data_collector.narrow_timer.acc_time)
+
 
         return contacts
 

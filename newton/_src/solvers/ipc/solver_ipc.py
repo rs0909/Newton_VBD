@@ -26,7 +26,11 @@ import warp as wp
 from ...core.types import override
 from ...sim import Contacts, Control, JointType, Model, State
 from ..solver import SolverBase
-from .particle_vbd_kernels_edit import (
+from ipc_kernels import (
+    project_Hessian_to_SPD,
+    trimesh_with_self_contact
+)
+from ..vbd.particle_vbd_kernels_edit import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     ParticleForceElementAdjacencyInfo,
@@ -56,43 +60,43 @@ from .particle_vbd_kernels_edit import (
     solve_trimesh_with_self_contact_penetration_free_tile,
     update_velocity,
 )
-from .rigid_vbd_kernels import (
-    _NUM_CONTACT_THREADS_PER_BODY,
-    RigidForceElementAdjacencyInfo,
-    # Iteration kernels
-    accumulate_body_body_contacts_per_body,  # Body-body (rigid-rigid) contacts (Gauss-Seidel mode)
-    accumulate_body_particle_contacts_per_body,  # Body-particle soft contacts (two-way coupling)
-    build_body_body_contact_lists,  # Body-body (rigid-rigid) contact adjacency
-    build_body_particle_contact_lists,  # Body-particle (rigid-particle) soft-contact adjacency
-    compute_cable_dahl_parameters,  # Cable bending plasticity
-    copy_rigid_body_transforms_back,
-    # Adjacency building kernels
-    count_num_adjacent_joints,
-    fill_adjacent_joints,
-    # Pre-iteration kernels (rigid AVBD)
-    forward_step_rigid_bodies,
-    solve_rigid_body,
-    # Post-iteration kernels
-    update_body_velocity,
-    update_cable_dahl_state,
-    update_duals_body_body_contacts,  # Body-body (rigid-rigid) contacts (AVBD penalty update)
-    update_duals_body_particle_contacts,  # Body-particle soft contacts (AVBD penalty update)
-    update_duals_joint,  # Cable joints (AVBD penalty update)
-    warmstart_body_body_contacts,  # Body-body (rigid-rigid) contacts (penalty warmstart)
-    warmstart_body_particle_contacts,  # Body-particle soft contacts (penalty warmstart)
-    warmstart_joints,  # Cable joints (stretch & bend)
-)
-from .tri_mesh_collision import (
+# from .rigid_vbd_kernels import (
+#     _NUM_CONTACT_THREADS_PER_BODY,
+#     RigidForceElementAdjacencyInfo,
+#     # Iteration kernels
+#     accumulate_body_body_contacts_per_body,  # Body-body (rigid-rigid) contacts (Gauss-Seidel mode)
+#     accumulate_body_particle_contacts_per_body,  # Body-particle soft contacts (two-way coupling)
+#     build_body_body_contact_lists,  # Body-body (rigid-rigid) contact adjacency
+#     build_body_particle_contact_lists,  # Body-particle (rigid-particle) soft-contact adjacency
+#     compute_cable_dahl_parameters,  # Cable bending plasticity
+#     copy_rigid_body_transforms_back,
+#     # Adjacency building kernels
+#     count_num_adjacent_joints,
+#     fill_adjacent_joints,
+#     # Pre-iteration kernels (rigid AVBD)
+#     forward_step_rigid_bodies,
+#     solve_rigid_body,
+#     # Post-iteration kernels
+#     update_body_velocity,
+#     update_cable_dahl_state,
+#     update_duals_body_body_contacts,  # Body-body (rigid-rigid) contacts (AVBD penalty update)
+#     update_duals_body_particle_contacts,  # Body-particle soft contacts (AVBD penalty update)
+#     update_duals_joint,  # Cable joints (AVBD penalty update)
+#     warmstart_body_body_contacts,  # Body-body (rigid-rigid) contacts (penalty warmstart)
+#     warmstart_body_particle_contacts,  # Body-particle soft contacts (penalty warmstart)
+#     warmstart_joints,  # Cable joints (stretch & bend)
+# )
+from ..vbd.tri_mesh_collision import (
     TriMeshCollisionDetector,
     TriMeshCollisionInfo,
 )
 
 
-class SolverVBD(SolverBase):
-    """An implicit solver using Vertex Block Descent (VBD) for particles and Augmented VBD (AVBD) for rigid bodies.
+class SolverIPC(SolverBase):
+    """An implicit solver using Incremental Potential Contact (IPC) for particles and Augmented VBD (AVBD) for rigid bodies.
 
     This unified solver supports:
-        - Particle simulation (cloth, soft bodies) using the VBD algorithm
+        - Particle simulation (cloth, soft bodies) using the IPC algorithm
         - Rigid body simulation (joints, contacts) using the AVBD algorithm
         - Coupled particle-rigid body systems
 
@@ -104,36 +108,13 @@ class SolverVBD(SolverBase):
         - Anka He Chen, Ziheng Liu, Yin Yang, and Cem Yuksel. 2024. Vertex Block Descent. ACM Trans. Graph. 43, 4, Article 116 (July 2024), 16 pages.
           https://doi.org/10.1145/3658179
     Note:
-        `SolverVBD` requires coloring information for both particles and rigid bodies:
+        `SolverIPC` requires coloring information for both particles and rigid bodies:
 
         - Particle coloring: :attr:`newton.Model.particle_color_groups` (required if particles are present)
         - Rigid body coloring: :attr:`newton.Model.body_color_groups` (required if rigid bodies are present)
 
         Call :meth:`newton.ModelBuilder.color` to automatically color both particles and rigid bodies.
 
-    Example
-    -------
-
-    .. code-block:: python
-
-        # Automatically color both particles and rigid bodies
-        builder.color()
-
-        model = builder.finalize()
-
-        solver = newton.solvers.SolverVBD(model)
-
-        # Initialize states and contacts
-        state_in = model.state()
-        state_out = model.state()
-        control = model.control()
-        contacts = model.collide(state_in)
-
-        # Simulation loop
-        for i in range(100):
-            contacts = model.collide(state_in)  # Update contacts
-            solver.step(state_in, state_out, control, contacts, dt)
-            state_in, state_out = state_out, state_in
     """
 
     def __init__(
@@ -168,8 +149,6 @@ class SolverVBD(SolverBase):
         rigid_enable_dahl_friction: bool = False,  # Cable bending plasticity/hysteresis
         rigid_dahl_eps_max: float | wp.array = 0.5,  # Dahl: max persistent strain
         rigid_dahl_tau: float | wp.array = 1.0,  # Dahl: memory decay length
-
-        ogc_contact: bool = False,
     ):
         """
         Args:
@@ -249,12 +228,6 @@ class SolverVBD(SolverBase):
 
         """
         super().__init__(model)
-        
-        self.ogc_contact = ogc_contact
-        if self.ogc_contact:
-            print()
-            print(">>> OGC Contact mode ON <<<")
-            print()
 
         # Common parameters
         self.iterations = iterations
@@ -372,10 +345,6 @@ class SolverVBD(SolverBase):
                 vertex_collision_buffer_pre_alloc=particle_vertex_contact_buffer_size,
                 edge_collision_buffer_pre_alloc=particle_edge_contact_buffer_size,
                 edge_edge_parallel_epsilon=particle_edge_parallel_epsilon,
-                v_adj_edges=self.particle_adjacency.v_adj_edges,
-                v_adj_edges_offsets=self.particle_adjacency.v_adj_edges_offsets,
-                v_adj_faces=self.particle_adjacency.v_adj_faces,
-                v_adj_faces_offsets=self.particle_adjacency.v_adj_faces_offsets,
             )
 
             self.compute_particle_contact_filtering_list(
@@ -962,17 +931,52 @@ class SolverVBD(SolverBase):
         update_rigid_history = self.update_rigid_history
         self.update_rigid_history = True
     
-        self.initialize_rigid_bodies(state_in, contacts, dt, update_rigid_history)
-        self.initialize_particles(state_in, dt)
+    
+        # init rigid
+        # init particle - collision detection
+        self.initialize_particles(state_in=state_in)
+        # projected newton
+        iter_num = 0
+        Eprev = self.evaluate_energy(state_in, state_out, contacts, dt, iter_num, self.iterations-1)
+        xprev = x
+        while True:
+            self.project_SPD(H)
+            p = self.cholmod()
+            alpha = min(1, self.CCD_line_search(x, p, C))
+            while True:
+                x = xprev + alpha * p
+                self.initialize_particles(state_in=state_in)
+                alpha = alpha/2
+                B = self.evaluate_energy(x, d, C)
+                if B <= Eprev:
+                    break;
+            
+            Eprev = B
+            xprev = x
 
-        for iter_num in range(self.iterations):
-            self.solve_rigid_body_iteration(state_in, state_out, contacts, dt)
-            self.solve_particle_iteration(state_in, state_out, contacts, dt, iter_num, self.iterations-1)
+            #update some parameters
 
-        self.finalize_rigid_bodies(state_out, dt)
-        self.finalize_particles(state_out, dt)
+            if self.should_terminate(p):
+                break
+            
+            iter_num += 1
+        # CHOLMOD (solver)
 
-    def initialize_particles(self, state_in: State, dt: float):
+
+        # finalize rigid
+        # finalize particle
+        self.finalize_particles(state_out=state_out, dt=dt)
+    
+
+    def should_terminate(self):
+        pass
+
+    def project_SPD(self):
+        # self.particle_hessians
+        wp.launch()
+        pass
+
+    def initialize_particles(self, state_in: State):
         """Initialize particle positions for the VBD iteration."""
         model = self.model
 
@@ -983,45 +987,10 @@ class SolverVBD(SolverBase):
         if self.particle_enable_self_contact:
             # Collision detection before initialization to compute conservative bounds
             if data_collector.is_log_nothing():
-                self.collision_detection_penetration_free(state_in, -1)
+                self.collision_detection(state_in, -1)
             else:
-                self.collision_detection_penetration_free_log_collision(state_in, -1)
+                self.collision_detection_log_collision(state_in, -1)
 
-            wp.launch(
-                kernel=forward_step_penetration_free,
-                inputs=[
-                    dt,
-                    model.gravity,
-                    self.particle_q_prev,
-                    state_in.particle_q,
-                    state_in.particle_qd,
-                    model.particle_inv_mass,
-                    state_in.particle_f,
-                    model.particle_flags,
-                    self.pos_prev_collision_detection,
-                    self.particle_conservative_bounds,
-                    self.inertia,
-                ],
-                dim=model.particle_count,
-                device=self.device,
-            )
-        else:
-            wp.launch(
-                kernel=forward_step,
-                inputs=[
-                    dt,
-                    model.gravity,
-                    self.particle_q_prev,
-                    state_in.particle_q,
-                    state_in.particle_qd,
-                    model.particle_inv_mass,
-                    state_in.particle_f,
-                    model.particle_flags,
-                    self.inertia,
-                ],
-                dim=model.particle_count,
-                device=self.device,
-            )
 
     def initialize_rigid_bodies(
         self,
@@ -1205,7 +1174,7 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
 
-    def solve_particle_iteration(self, state_in: State, state_out: State, contacts: Contacts, dt: float, iter_num: int, max_iter_num=-1):
+    def evaluate_energy(self, state_in: State, state_out: State, contacts: Contacts, dt: float, iter_num: int, max_iter_num=-1):
         """Solve one VBD iteration for particles."""
         model = self.model
 
@@ -1233,10 +1202,10 @@ class SolverVBD(SolverBase):
                 and iter_num % self.particle_collision_detection_interval == 0
             ):
                 if data_collector.is_log_nothing():
-                    self.collision_detection_penetration_free(state_in, iter_num)
+                    self.collision_detection(state_in, iter_num)
                 else:
                     col_detect_time_start = time.perf_counter()
-                    self.collision_detection_penetration_free_log_collision(state_in, iter_num)
+                    self.collision_detection_log_collision(state_in, iter_num)
                     col_detect_time_end = time.perf_counter()
                     data_collector.record_to_frame("col_detect_time", col_detect_time_end - col_detect_time_start)
             elif not data_collector.is_log_nothing():
@@ -1443,137 +1412,40 @@ class SolverVBD(SolverBase):
 
             # Solve for this color group
             if self.particle_enable_self_contact:
-                if self.use_particle_tile_solve:
-                    wp.launch(
-                        kernel=solve_trimesh_with_self_contact_penetration_free_tile,
-                        dim=model.particle_color_groups[color].size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                        block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                        inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                            self.pos_prev_collision_detection,
-                            self.particle_conservative_bounds,
-                        ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces
-                        ],
-                        device=self.device,
-                    )
-                else:
-                    wp.launch(
-                        kernel=solve_trimesh_with_self_contact_penetration_free,
-                        dim=model.particle_color_groups[color].size,
-                        inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                            self.pos_prev_collision_detection,
-                            self.particle_conservative_bounds,
-                        ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces    
-                        ],
-                        device=self.device,
-                    )
+                wp.launch(
+                    kernel=trimesh_with_self_contact,
+                    dim=model.particle_color_groups[color].size,
+                    inputs=[
+                        dt,
+                        model.particle_color_groups[color],
+                        self.particle_q_prev,
+                        state_in.particle_q,
+                        state_in.particle_qd,
+                        model.particle_mass,
+                        self.inertia,
+                        model.particle_flags,
+                        model.tri_indices,
+                        model.tri_poses,
+                        model.tri_materials,
+                        model.tri_areas,
+                        model.edge_indices,
+                        model.edge_rest_angle,
+                        model.edge_rest_length,
+                        model.edge_bending_properties,
+                        self.particle_adjacency,
+                        self.particle_forces,
+                        self.particle_hessians,
+                        self.pos_prev_collision_detection,
+                        self.particle_conservative_bounds,
+                    ],
+                    outputs=[
+                        state_out.particle_q,
+                        self.stvk_forces    
+                    ],
+                    device=self.device,
+                )
             else:
-                if self.use_particle_tile_solve:
-                    wp.launch(
-                        kernel=solve_trimesh_no_self_contact_tile,
-                        inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                        ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces
-                        ],
-                        dim=model.particle_color_groups[color].size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                        block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                        device=self.device,
-                    )
-                else:
-                    wp.launch(
-                        kernel=solve_trimesh_no_self_contact,
-                        inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                        ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces
-                        ],
-                        dim=model.particle_color_groups[color].size,
-                        device=self.device,
-                    )
+                print("WARNING! No self collision case is not supported")
 
             # Copy positions back
             wp.launch(
@@ -1949,50 +1821,25 @@ class SolverVBD(SolverBase):
             )
 
     # called on init(1 time) and solve(iteration times)
-    def collision_detection_penetration_free(self, current_state: State, iter_num=-2):
+    def collision_detection(self, current_state: State, iter_num=-2):
         self.trimesh_collision_detector.refit(current_state.particle_q)
-        if self.ogc_contact:
-            self.trimesh_collision_detector.vertex_triangle_collision_detection_ogc(
-                self.particle_self_contact_margin,
-                min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
-                min_distance_filtering_ref_pos=self.particle_q_rest,
-            )
-            self.trimesh_collision_detector.edge_edge_collision_detection_ogc(
-                self.particle_self_contact_margin,
-                min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
-                min_distance_filtering_ref_pos=self.particle_q_rest,
-            )
-        else:
-            self.trimesh_collision_detector.vertex_triangle_collision_detection(
-                self.particle_self_contact_margin,
-                min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
-                min_distance_filtering_ref_pos=self.particle_q_rest,
-            )
-            self.trimesh_collision_detector.edge_edge_collision_detection(
-                self.particle_self_contact_margin,
-                min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
-                min_distance_filtering_ref_pos=self.particle_q_rest,
-            )
+        self.trimesh_collision_detector.vertex_triangle_collision_detection(
+            self.particle_self_contact_margin,
+            min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
+            min_distance_filtering_ref_pos=self.particle_q_rest,
+        )
+        self.trimesh_collision_detector.edge_edge_collision_detection(
+            self.particle_self_contact_margin,
+            min_query_radius=self.particle_rest_shape_contact_exclusion_radius,
+            min_distance_filtering_ref_pos=self.particle_q_rest,
+        )
 
         self.pos_prev_collision_detection.assign(current_state.particle_q)
-        wp.launch(
-            kernel=compute_particle_conservative_bound,
-            inputs=[
-                self.particle_conservative_bound_relaxation,
-                self.particle_self_contact_margin,
-                self.particle_adjacency,
-                self.trimesh_collision_detector.collision_info,
-            ],
-            outputs=[
-                self.particle_conservative_bounds,
-            ],
-            dim=self.model.particle_count,
-            device=self.device,
-        )
+        
 
     
     # called on init(1 time) and solve(iteration times)
-    def collision_detection_penetration_free_log_collision(self, current_state: State, iter_num=-2):
+    def collision_detection_log_collision(self, current_state: State, iter_num=-2):
         self.trimesh_collision_detector.refit(current_state.particle_q)
         self.trimesh_collision_detector.vertex_triangle_collision_detection(
             self.particle_self_contact_margin,
@@ -2008,20 +1855,10 @@ class SolverVBD(SolverBase):
         data_collector.record_to_iteration("cloth_self_ee_col_count", self.trimesh_collision_detector.edge_colliding_edges_count.numpy().sum(), iter_num)
 
         self.pos_prev_collision_detection.assign(current_state.particle_q)
-        wp.launch(
-            kernel=compute_particle_conservative_bound,
-            inputs=[
-                self.particle_conservative_bound_relaxation,
-                self.particle_self_contact_margin,
-                self.particle_adjacency,
-                self.trimesh_collision_detector.collision_info,
-            ],
-            outputs=[
-                self.particle_conservative_bounds,
-            ],
-            dim=self.model.particle_count,
-            device=self.device,
-        )
+
+
+
+        
 
     def rebuild_bvh(self, state: State):
         """This function will rebuild the BVHs used for detecting self-contacts using the input `state`.

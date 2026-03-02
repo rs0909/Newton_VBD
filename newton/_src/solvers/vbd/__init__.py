@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .solver_vbd import SolverVBD
+from .solver_vbd_edit import SolverVBD
 
 __all__ = [
     "SolverVBD",

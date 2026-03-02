@@ -3287,3 +3287,38 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             pos_new[particle_index] = apply_conservative_bound_truncation(
                 particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
             )
+
+#######################
+'''
+[assign_pair_ids]
+방식: 이 커널은 collision detection 직후에, contact list 길이만큼 병렬로 돌면 돼.
+입력: 
+- trimesh_collision_info, uv, edge_indices, tri_indices 등
+출력:
+- contact_pair_id[contact_idx]
+- pair table 갱신: key insert/lookup, age=CONTACT, (optional) last_seen_iter 업데이트
+
+
+[decay_pairs]
+방식: substep 끝(또는 iter 0 끝)에서
+pair_age를 줄이고(dead 처리) / last_seen가 갱신 안 된 pair는 age-- / age==0이면 q reset
+
+
+[uv_to_cell]
+
+'''
+@wp.kernel
+def assign_pair_ids(
+    
+    ):
+    
+
+    return
+
+@wp.kernel
+def decay_pairs(
+        
+    ):
+    
+
+    return

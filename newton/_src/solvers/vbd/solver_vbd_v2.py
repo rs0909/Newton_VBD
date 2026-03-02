@@ -1239,6 +1239,7 @@ class SolverVBD(SolverBase):
                     self.collision_detection_penetration_free_log_collision(state_in, iter_num)
                     col_detect_time_end = time.perf_counter()
                     data_collector.record_to_frame("col_detect_time", col_detect_time_end - col_detect_time_start)
+                
             elif not data_collector.is_log_nothing():
                 data_collector.record_to_frame("col_detect_time", 0)
         elif not data_collector.is_log_nothing():

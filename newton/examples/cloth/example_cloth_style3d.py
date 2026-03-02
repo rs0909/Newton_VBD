@@ -90,7 +90,7 @@ class Example:
                 ),
                 mesh=Mesh(avatar_mesh_points, avatar_mesh_indices),
             )
-            # fixed_points = [0]
+            fixed_points = [0]
             fixed_points = []
         else:
             grid_dim = 100

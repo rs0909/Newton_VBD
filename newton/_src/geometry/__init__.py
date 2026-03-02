@@ -37,7 +37,7 @@ from .types import (
     MESH_MAXHULLVERT,
     SDF,
     GeoType,
-    Mesh,
+    Mesh, DynamicMesh
 )
 from .utils import compute_shape_radius
 

@@ -1,26 +1,13 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 ###########################################################################
-# Example Cloth Twist
+# Comparison test case: Twisting Cloth
 #
-# This simulation demonstrates twisting an FEM cloth model using the VBD
-# solver, showcasing its ability to handle complex self-contacts while
-# ensuring it remains intersection-free.
+# Modified from the original cloth_twist test, with only the rotation
+# duration and direction changed.
 #
-# Command: python -m newton.examples cloth_twist
+# N: number of substeps per frame and iterations per substep (N^2
+# iterations in total)
+#
+# difficulty: 'easy' or 'hard', only affecting the twisting duration
 #
 ###########################################################################
 
@@ -30,13 +17,15 @@ import os
 import numpy as np
 import warp as wp
 import warp.examples
-from pxr import Usd
+from pxr import Usd, UsdGeom
 
 import newton
 import newton.examples
-import newton.usd
 from newton import ParticleFlags
+import time
 
+N = 80
+difficulty = 'easy'
 
 @wp.kernel
 def initialize_rotation(
@@ -85,8 +74,6 @@ def apply_rotation(
     pos_1: wp.array(dtype=wp.vec3),
 ):
     cur_t = t[0]
-    if cur_t > end_time:
-        return
 
     tid = wp.tid()
     v_index = vertex_indices_to_rot[wp.tid()]
@@ -97,7 +84,17 @@ def apply_rotation(
     uy = rot_axis[1]
     uz = rot_axis[2]
 
+    flag = 0
+    tmp = cur_t
+    tmp2 = end_time
     theta = cur_t * angular_velocity
+    while tmp > tmp2:
+        angular_velocity *= -1.0
+        theta += (tmp - tmp2) * 2.0 * angular_velocity
+        tmp -= tmp2
+        # if flag == 0:
+        #     flag = 1
+        tmp2 = min(tmp2, end_time) * 2.0
 
     R = wp.mat33(
         wp.cos(theta) + ux * ux * (1.0 - wp.cos(theta)),
@@ -124,34 +121,33 @@ def apply_rotation(
 
 
 class Example:
-    def __init__(self, viewer, args=None):
+    def __init__(self, viewer):
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
 
         # group related attributes by prefix
         self.sim_time = 0.0
-        self.sim_substeps = 10  # must be an even number when using CUDA Graph
+        self.sim_substeps = N  # must be an even number when using CUDA Graph
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.iterations = 4
+        self.iterations = N
         # the BVH used by SolverVBD will be rebuilt every self.bvh_rebuild_frames
         # When the simulated object deforms significantly, simply refitting the BVH can lead to deterioration of the BVH's
         # quality, in this case we need to completely rebuild the tree to achieve better query efficiency.
         self.bvh_rebuild_frames = 10
 
         self.rot_angular_velocity = math.pi / 3
-        self.rot_end_time = 10
+        self.rot_end_time = 6.0 if difficulty == 'easy' else 15.0
 
         # save a reference to the viewer
         self.viewer = viewer
 
         usd_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "square_cloth.usd"))
-        usd_prim = usd_stage.GetPrimAtPath("/root/cloth/cloth")
+        usd_geom = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/root/cloth/cloth"))
 
-        cloth_mesh = newton.usd.get_mesh(usd_prim)
-        mesh_points = cloth_mesh.vertices
-        mesh_indices = cloth_mesh.indices
+        mesh_points = np.array(usd_geom.GetPointsAttr().Get())
+        mesh_indices = np.array(usd_geom.GetFaceVertexIndicesAttr().Get())
 
         vertices = [wp.vec3(v) for v in mesh_points]
         self.faces = mesh_indices.reshape(-1, 3)
@@ -192,18 +188,14 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             self.iterations,
-            particle_enable_self_contact=True,
+            # handle_self_contact=True,
             particle_self_contact_radius=0.002,
             particle_self_contact_margin=0.0035,
-            # ogc_contact=True
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-
-        # Create collision pipeline (default: unified)
-        self.collision_pipeline = newton.examples.create_collision_pipeline(self.model, args)
-        self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
+        self.contacts = self.model.collide(self.state_0)
 
         rot_axes = [[0, 1, 0]] * len(right_side) + [[0, -1, 0]] * len(left_side)
 
@@ -234,7 +226,6 @@ class Example:
         self.viewer.set_model(self.model)
 
         # put graph capture into it's own function
-        self.simulate()
         self.capture()
 
     def capture(self):
@@ -245,13 +236,10 @@ class Example:
             self.graph = capture.graph
 
     def simulate(self):
-        self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
+        self.contacts = self.model.collide(self.state_0)
         self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-
-            # apply forces to the model for picking, wind, etc
-            self.viewer.apply_forces(self.state_0)
 
             wp.launch(
                 kernel=apply_rotation,
@@ -284,6 +272,7 @@ class Example:
             self.simulate()
 
         self.sim_time += self.frame_dt
+        wp.synchronize_device()
 
     def render(self):
         if self.viewer is None:
@@ -294,9 +283,10 @@ class Example:
 
         # Render model-driven content (ground plane)
         self.viewer.log_state(self.state_0)
+
         self.viewer.end_frame()
 
-    def test_final(self):
+    def test(self):
         p_lower = wp.vec3(-0.6, -0.9, -0.6)
         p_upper = wp.vec3(0.6, 0.9, 0.6)
         newton.examples.test_particle_state(
@@ -319,6 +309,6 @@ if __name__ == "__main__":
     viewer, args = newton.examples.init(parser)
 
     # Create example and run
-    example = Example(viewer, args)
+    example = Example(viewer)
 
     newton.examples.run(example, args)

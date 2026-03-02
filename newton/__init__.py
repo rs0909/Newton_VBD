@@ -34,7 +34,7 @@ __all__ = [
 from ._src.geometry import (
     SDF,
     GeoType,
-    Mesh,
+    Mesh, DynamicMesh,
     ParticleFlags,
     SAPSortType,
     ShapeFlags,

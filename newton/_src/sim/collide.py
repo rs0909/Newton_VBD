@@ -235,7 +235,7 @@ class CollisionPipeline:
                     model.shape_body,
                     model.shape_type,
                     model.shape_scale,
-                    model.shape_source_ptr,
+                    model.shape_source_ptr, # yk: shape source on colliding!
                     model.shape_world,
                     self.soft_contact_margin,
                     self.soft_contact_max,

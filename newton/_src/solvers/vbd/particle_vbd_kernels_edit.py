@@ -709,6 +709,32 @@ def damp_collision(
     else:
         return wp.vec3(0.0), wp.mat33(0.0)
 
+@wp.kernel
+def finalize_friction_memory(
+    fric_mem_world: wp.array(dtype=wp.vec3),
+    fric_mem_n: wp.array(dtype=wp.vec3),
+    accum_world: wp.array(dtype=wp.vec3),
+    accum_n: wp.array(dtype=wp.vec3),
+    accum_cnt: wp.array(dtype=wp.int32),
+    alpha: float,      # update strength, 예: 0.5
+    decay: float       # no-contact decay, 예: 0.98
+):
+    v = wp.tid()
+    cnt = accum_cnt[v]
+    m_old = fric_mem_world[v]
+
+    if cnt > 0:
+        m_new = accum_world[v] / float(cnt)
+        fric_mem_world[v] = (1.0 - alpha) * m_old + alpha * m_new
+
+        n_new = accum_n[v] / float(cnt)
+        # normalize safe
+        ln = wp.length(n_new)
+        if ln > 1e-12:
+            fric_mem_n[v] = n_new / ln
+    else:
+        fric_mem_world[v] = decay * m_old
+
 
 @wp.func
 def evaluate_edge_edge_contact(
@@ -726,6 +752,11 @@ def evaluate_edge_edge_contact(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    use_ws: bool,
+    mem_world: wp.array(dtype=wp.vec3),
+    mem_n: wp.array(dtype=wp.vec3),
+    reset_cos: float,
+    warm_beta: float,
 ):
     r"""
     Returns the edge-edge contact force and hessian, including the friction force.
@@ -793,8 +824,58 @@ def evaluate_edge_edge_contact(
             axis_2[2],
         )
 
-        u = wp.transpose(T) * dx
+        u_inc_tb = wp.transpose(T) * dx          # 이번 step의 상대 접선 이동(접선좌표)
+        u_tb = u_inc_tb
+        mem_world_local_1 = mem_world[e1_v1]
+        mem_world_local_2 = mem_world[e1_v2]
+        
+        if use_ws: 
+            # normal이 너무 바뀌었으면 메모리 리셋
+            # v1
+            if wp.dot(mem_n[e1_v1], collision_normal) < reset_cos:
+                mem_world_local_1 = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local_1 = mem_world[e1_v1]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb_1 = wp.transpose(T) * mem_world_local_1
+            u_tb_1 = u_inc_tb + q_ws_tb_1
+
+            # v2
+            if wp.dot(mem_n[e1_v2], collision_normal) < reset_cos:
+                mem_world_local_2 = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local_2 = mem_world[e1_v2]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb_2 = wp.transpose(T) * mem_world_local_2
+            u_tb_2 = u_inc_tb + q_ws_tb_2
+            u_for_fric = (1.0-s)*u_tb_1 + s*u_tb_2
+
+        else:
+            u_tb_1 = u_inc_tb
+            u_tb_2 = u_inc_tb
+            q_ws_tb_1 = wp.vec2(0.0, 0.0)
+            q_ws_tb_2 = wp.vec2(0.0, 0.0)
+            u_for_fric = u_tb
+
+        # "T*u (blend된 u를 월드로 변환)" — 여기서 world로 변환한 값을 리턴해서 메모리 업데이트에 씀
+        # warm_u_world_1 = T * u_tb_1
+        # warm_u_world_2 = T * u_tb_2
+        warm_u_world_1 = (1.0 - warm_beta) * mem_world_local_1 + warm_beta * (T * u_tb_1)
+        warm_u_world_2 = (1.0 - warm_beta) * mem_world_local_2 + warm_beta * (T * u_tb_2)
+
         eps_U = friction_epsilon * dt
+
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient,
+            -dEdD,
+            T,
+            u_for_fric,
+            eps_U,
+        )
+        friction_force = friction_force * v_bary
+        friction_hessian = friction_hessian * v_bary * v_bary
 
         # fmt: off
         if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -803,10 +884,6 @@ def evaluate_edge_edge_contact(
                 collision_force[0], collision_force[1], collision_force[2], collision_hessian[0, 0], collision_hessian[0, 1], collision_hessian[0, 2], collision_hessian[1, 0], collision_hessian[1, 1], collision_hessian[1, 2], collision_hessian[2, 0], collision_hessian[2, 1], collision_hessian[2, 2],
             )
         # fmt: on
-
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
-        friction_force = friction_force * v_bary
-        friction_hessian = friction_hessian * v_bary * v_bary
 
         # # fmt: off
         # if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -836,8 +913,9 @@ def evaluate_edge_edge_contact(
     else:
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        warm_u_world_1, warm_u_world_2 = wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
-    return collision_force, collision_hessian
+    return collision_force, collision_hessian, warm_u_world_1, warm_u_world_2
 
 
 @wp.func
@@ -854,6 +932,11 @@ def evaluate_edge_edge_contact_2_vertices(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    use_ws: bool,
+    mem_world: wp.array(dtype=wp.vec3),
+    mem_n: wp.array(dtype=wp.vec3),
+    reset_cos: float,
+    warm_beta: float,
 ):
     r"""
     Returns the edge-edge contact force and hessian, including the friction force.
@@ -918,8 +1001,58 @@ def evaluate_edge_edge_contact_2_vertices(
             axis_2[2],
         )
 
-        u = wp.transpose(T) * dx
+        u_inc_tb = wp.transpose(T) * dx          # 이번 step의 상대 접선 이동(접선좌표)
+        u_tb = u_inc_tb
+        mem_world_local_1 = mem_world[e1_v1]
+        mem_world_local_2 = mem_world[e1_v2]
+
+        if use_ws:
+            
+            # normal이 너무 바뀌었으면 메모리 리셋
+            # v1
+            if wp.dot(mem_n[e1_v1], collision_normal) < reset_cos:
+                mem_world_local_1 = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local_1 = mem_world[e1_v1]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb_1 = wp.transpose(T) * mem_world_local_1
+            u_tb_1 = u_inc_tb + q_ws_tb_1
+
+            # v2
+            if wp.dot(mem_n[e1_v2], collision_normal) < reset_cos:
+                mem_world_local_2 = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local_2 = mem_world[e1_v2]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb_2 = wp.transpose(T) * mem_world_local_2
+            u_tb_2 = u_inc_tb + q_ws_tb_2
+            
+            u_for_fric = (1.0-s)*u_tb_1 + s*u_tb_2
+        else:
+            u_tb_1 = u_inc_tb
+            u_tb_2 = u_inc_tb
+            q_ws_tb_1 = wp.vec2(0.0, 0.0)
+            q_ws_tb_2 = wp.vec2(0.0, 0.0)
+            u_for_fric = u_tb
+
+        # "T*u (blend된 u를 월드로 변환)" — 여기서 world로 변환한 값을 리턴해서 메모리 업데이트에 씀
+        # warm_u_world_1 = T * u_tb_1
+        # warm_u_world_2 = T * u_tb_2
+        warm_u_world_1 = (1.0 - warm_beta) * mem_world_local_1 + warm_beta * (T * u_tb_1)
+        warm_u_world_2 = (1.0 - warm_beta) * mem_world_local_2 + warm_beta * (T * u_tb_2)
+        
         eps_U = friction_epsilon * dt
+
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient,
+            -dEdD,
+            T,
+            u_for_fric,
+            eps_U,
+        )
+
 
         # fmt: off
         if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -928,8 +1061,6 @@ def evaluate_edge_edge_contact_2_vertices(
                 collision_force[0], collision_force[1], collision_force[2], collision_hessian[0, 0], collision_hessian[0, 1], collision_hessian[0, 2], collision_hessian[1, 0], collision_hessian[1, 1], collision_hessian[1, 2], collision_hessian[2, 0], collision_hessian[2, 1], collision_hessian[2, 2],
             )
         # fmt: on
-
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
 
         # # fmt: off
         # if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -970,12 +1101,12 @@ def evaluate_edge_edge_contact_2_vertices(
         collision_force_1 += damping_force + bs[1] * friction_force
         collision_hessian_1 += damping_hessian + bs[1] * bs[1] * friction_hessian
 
-        return True, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1
+        return True, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1,  warm_u_world_1, warm_u_world_2, collision_normal
     else:
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-        return False, collision_force, collision_force, collision_hessian, collision_hessian
+        return False, collision_force, collision_force, collision_hessian, collision_hessian, wp.vec3(0.0,0.0,0.0), wp.vec3(0.0,0.0,0.0), collision_normal
 
 @wp.func
 def evaluate_edge_edge_contact_2_vertices_log_collision(
@@ -991,6 +1122,11 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    use_ws: bool,
+    mem_world: wp.array(dtype=wp.vec3),
+    mem_n: wp.array(dtype=wp.vec3),
+    reset_cos: float,
+    warm_beta: float,
 ):
     r"""
     Returns the edge-edge contact force and hessian, including the friction force.
@@ -1029,13 +1165,14 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
 
     diff = c1 - c2
     dis = st[2]
-    collision_normal = diff / dis
+    
 
     if 0.0 < dis < collision_radius:
         bs = wp.vec4(1.0 - s, s, -1.0 + t, -t)
 
         dEdD, d2E_dDdD = evaluate_self_contact_force_norm(dis, collision_radius, collision_stiffness)
 
+        collision_normal = diff / dis
         collision_force = -dEdD * collision_normal
         collision_hessian = d2E_dDdD * wp.outer(collision_normal, collision_normal)
 
@@ -1055,8 +1192,56 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
             axis_2[2],
         )
 
-        u = wp.transpose(T) * dx
+        u_inc_tb = wp.transpose(T) * dx          # 이번 step의 상대 접선 이동(접선좌표)
+        u_tb = u_inc_tb
+        
+
+        if use_ws:
+            
+            # normal이 너무 바뀌었으면 메모리 리셋
+            # v1
+            if wp.dot(mem_n[e1_v1], collision_normal) < reset_cos:
+                mem_world_local_1 = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local_1 = mem_world[e1_v1]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb_1 = wp.transpose(T) * mem_world_local_1
+            u_tb_1 = u_inc_tb + q_ws_tb_1
+
+            # v2
+            if wp.dot(mem_n[e1_v2], collision_normal) < reset_cos:
+                mem_world_local_2 = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local_2 = mem_world[e1_v2]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb_2 = wp.transpose(T) * mem_world_local_2
+            u_tb_2 = u_inc_tb + q_ws_tb_2
+            u_for_fric = (1.0-s)*u_tb_1 + s*u_tb_2
+        else:
+            u_tb_1 = u_inc_tb
+            u_tb_2 = u_inc_tb
+            q_ws_tb_1 = wp.vec2(0.0, 0.0)
+            q_ws_tb_2 = wp.vec2(0.0, 0.0)
+            u_for_fric = u_tb
+            mem_world_local_1 = mem_world[e1_v1]
+            mem_world_local_2 = mem_world[e1_v2]
+
+        # "T*u (blend된 u를 월드로 변환)" — 여기서 world로 변환한 값을 리턴해서 메모리 업데이트에 씀
+        warm_u_world_1 = (1.0 - warm_beta) * mem_world_local_1 + warm_beta * (T * u_tb_1)
+        warm_u_world_2 = (1.0 - warm_beta) * mem_world_local_2 + warm_beta * (T * u_tb_2)
+
         eps_U = friction_epsilon * dt
+
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient,
+            -dEdD,
+            T,
+            u_for_fric,
+            eps_U,
+        )
+
 
         # fmt: off
         if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1065,8 +1250,6 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
                 collision_force[0], collision_force[1], collision_force[2], collision_hessian[0, 0], collision_hessian[0, 1], collision_hessian[0, 2], collision_hessian[1, 0], collision_hessian[1, 1], collision_hessian[1, 2], collision_hessian[2, 0], collision_hessian[2, 1], collision_hessian[2, 2],
             )
         # fmt: on
-
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
 
         # # fmt: off
         # if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1081,8 +1264,8 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
 
         collision_force_0 = collision_force * bs[0] # e1 v1
         collision_force_1 = collision_force * bs[1] # e1 v2
-        contacts_normal_contact_force0 = collision_force_0
-        contacts_normal_contact_force1 = collision_force_1
+        contacts_normal_contact_force0_arr = collision_force_0
+        contacts_normal_contact_force1_arr = collision_force_1
 
         collision_hessian_0 = collision_hessian * bs[0] * bs[0]
         collision_hessian_1 = collision_hessian * bs[1] * bs[1]
@@ -1095,8 +1278,8 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
             collision_damping,
             dt,
         )
-        ncfs = contacts_normal_contact_force0 # normal contact force sum
-        ncfm = contacts_normal_contact_force0 # normal contact force min
+        ncfs = damping_force # normal contact force sum
+        ncfm = damping_force # normal contact force min
 
 
         collision_force_0 += damping_force + bs[0] * friction_force
@@ -1111,9 +1294,9 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
             collision_damping,
             dt,
         )
-        ncfs += contacts_normal_contact_force1
-        if wp.length(contacts_normal_contact_force1) < wp.length(ncfm):
-            ncfm = contacts_normal_contact_force1
+        ncfs += damping_force
+        if wp.length(damping_force) < wp.length(ncfm):
+            ncfm = damping_force
 
         collision_force_1 += damping_force + bs[1] * friction_force
         collision_hessian_1 += damping_hessian + bs[1] * bs[1] * friction_hessian
@@ -1124,26 +1307,28 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
         
                 T,
                 collision_normal, 
-                wp.length(u), # u_norm
+                wp.length(u_tb), # u_norm
                 eps_U,
                 friction_force,
                 ncfs,
                 ncfm,
 
 
-                contacts_normal_contact_force0,
-                contacts_normal_contact_force1,
+                contacts_normal_contact_force0_arr,
+                contacts_normal_contact_force1_arr,
                 wp.vec3(0.0, 0.0, 0.0),
                 wp.vec3(0.0, 0.0, 0.0),
                 contacts_friction0,
                 contacts_friction1,
                 wp.vec3(0.0, 0.0, 0.0),
-                wp.vec3(0.0, 0.0, 0.0)
+                wp.vec3(0.0, 0.0, 0.0),
+                warm_u_world_1,
+                warm_u_world_2,
         )
     else:
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        
+        collision_normal = wp.vec3(0.0, 0.0, 0.0)
         T = mat32(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         return (False, collision_force, collision_force, collision_hessian, collision_hessian,
@@ -1165,6 +1350,8 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
                 collision_force,
                 collision_force,
                 collision_force,
+                wp.vec3(0.0,0.0,0.0), 
+                wp.vec3(0.0,0.0,0.0),
         )
 
 
@@ -1182,6 +1369,11 @@ def evaluate_vertex_triangle_collision_force_hessian(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    use_ws: bool,
+    mem_world: wp.array(dtype=wp.vec3), 
+    mem_n: wp.array(dtype=wp.vec3), 
+    reset_cos: float, 
+    warm_beta: float,
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1193,9 +1385,26 @@ def evaluate_vertex_triangle_collision_force_hessian(
 
     diff = p - closest_p
     dis = wp.length(diff)
-    collision_normal = diff / dis
+    if 0.0 < dis and dis < collision_radius:
+        collision_normal = diff / dis
+    else:
+        collision_normal = wp.vec3(0.0, 0.0, 0.0)
 
     if dis < collision_radius:
+
+        # 업데이트 대상 vertex id 선택 (v_order에 따라)
+        if v_order == 0:
+            vid = tri_indices[tri, 0]
+        elif v_order == 1:
+            vid = tri_indices[tri, 1]
+        elif v_order == 2:
+            vid = tri_indices[tri, 2]
+        else:
+            vid = v
+
+        mem_n_local = mem_n[vid]
+        mem_world_local = mem_world[vid]
+
         bs = wp.vec4(-bary[0], -bary[1], -bary[2], 1.0)
         v_bary = bs[v_order]
 
@@ -1218,12 +1427,33 @@ def evaluate_vertex_triangle_collision_force_hessian(
         e0, e1 = build_orthonormal_basis(collision_normal)
 
         T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
+        u_inc_tb = wp.transpose(T) * dx
+        u_tb = u_inc_tb
 
-        u = wp.transpose(T) * dx
+        if use_ws:
+            # normal이 너무 바뀌었으면 메모리 리셋
+            if wp.dot(mem_n, collision_normal) < reset_cos:
+                mem_world_local = wp.vec3(0.0, 0.0, 0.0)
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb = wp.transpose(T) * mem_world_local
+            u_tb = u_inc_tb + q_ws_tb
+        else:
+            q_ws_tb = wp.vec2(0.0, 0.0)
+
+        # "T*u (blend된 u를 월드로 변환)" — 여기서 world로 변환한 값을 리턴해서 메모리 업데이트에 씀
+        warm_u_world = (1.0 - warm_beta) * mem_world_local + warm_beta * (T * u_tb)
+
+        u_norm = wp.length(u_tb)
         eps_U = friction_epsilon * dt
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
-
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient,
+            -dEdD,
+            T,
+            u_tb,
+            eps_U,
+        )
         # fmt: off
         if wp.static("contact_force_hessian_vt" in VBD_DEBUG_PRINTING_OPTIONS):
             wp.printf(
@@ -1255,7 +1485,7 @@ def evaluate_vertex_triangle_collision_force_hessian(
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    return collision_force, collision_hessian
+    return collision_force, collision_hessian, warm_u_world
 
 
 @wp.func
@@ -1271,6 +1501,11 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    use_ws: bool,
+    mem_world: wp.array(dtype=wp.vec3), 
+    mem_n: wp.array(dtype=wp.vec3), 
+    reset_cos: float, 
+    warm_beta: float
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1282,9 +1517,14 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
 
     diff = p - closest_p
     dis = wp.length(diff)
-    collision_normal = diff / dis
 
     if 0.0 < dis < collision_radius:
+
+        collision_normal = diff / dis
+
+        mem_n_local = mem_n[v]
+        mem_world_local = mem_world[v]
+        
         bs = wp.vec4(-bary[0], -bary[1], -bary[2], 1.0)
 
         dEdD, d2E_dDdD = evaluate_self_contact_force_norm(dis, collision_radius, collision_stiffness)
@@ -1306,12 +1546,31 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
         e0, e1 = build_orthonormal_basis(collision_normal)
 
         T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
+        u_inc_tb = wp.transpose(T) * dx
+        u_tb = u_inc_tb
 
-        u = wp.transpose(T) * dx
+        if use_ws:
+            # normal이 너무 바뀌었으면 메모리 리셋
+            if wp.dot(mem_n_local, collision_normal) < reset_cos:
+                mem_world_local = wp.vec3(0.0, 0.0, 0.0)
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb = wp.transpose(T) * mem_world_local
+            u_tb = u_inc_tb + q_ws_tb
+
+        # "T*u (blend된 u를 월드로 변환)" — 여기서 world로 변환한 값을 리턴해서 메모리 업데이트에 씀
+        warm_u_world = (1.0 - warm_beta) * mem_world_local + warm_beta * (T * u_tb)
+
+        u_norm = wp.length(u_tb)
         eps_U = friction_epsilon * dt
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
-
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient,
+            -dEdD,
+            T,
+            u_tb,
+            eps_U,
+        )
         # fmt: off
         if wp.static("contact_force_hessian_vt" in VBD_DEBUG_PRINTING_OPTIONS):
             wp.printf(
@@ -1389,10 +1648,14 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
             collision_hessian_1,
             collision_hessian_2,
             collision_hessian_3,
+            warm_u_world,
+            collision_normal
         )
     else:
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        warm_u_world = wp.vec3(0.0, 0.0, 0.0)
+        collision_normal = wp.vec3(0.0, 0.0, 0.0)
 
         return (
             False,
@@ -1404,6 +1667,8 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
             collision_hessian,
             collision_hessian,
             collision_hessian,
+            warm_u_world,
+            collision_normal
         )
 
 
@@ -1421,6 +1686,11 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    use_ws: bool,
+    mem_world: wp.array(dtype=wp.vec3),  # persistent memory (world)
+    mem_n: wp.array(dtype=wp.vec3),  # persistent normal (world)
+    reset_cos: float, # blend ratio
+    warm_beta: float  # e.g. cos(60deg)=0.5 or cos(75deg)
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1432,9 +1702,11 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
 
     diff = p - closest_p
     dis = wp.length(diff)
-    collision_normal = diff / dis
 
     if 0.0 < dis < collision_radius:
+        collision_normal = diff / dis
+        mem_n_local = mem_n[v]
+
         bs = wp.vec4(-bary[0], -bary[1], -bary[2], 1.0)
 
         dEdD, d2E_dDdD = evaluate_self_contact_force_norm(dis, collision_radius, collision_stiffness)
@@ -1456,13 +1728,35 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
         e0, e1 = build_orthonormal_basis(collision_normal)
 
         T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
+        u_inc_tb = wp.transpose(T) * dx
+        u_tb = u_inc_tb
 
-        u = wp.transpose(T) * dx
-        u_norm = wp.length(u)
+        if use_ws:
+            # normal이 너무 바뀌었으면 메모리 리셋
+            if wp.dot(mem_n_local, collision_normal) < reset_cos:
+                mem_world_local = wp.vec3(0.0, 0.0, 0.0)
+            else:
+                mem_world_local = mem_world[v]
+
+            # (월드에 저장된) 메모리를 현재 접선 basis로 투영해서 더해줌
+            q_ws_tb = wp.transpose(T) * mem_world_local
+            u_tb = u_inc_tb + q_ws_tb
+        else:
+            mem_world_local = mem_world[v]
+
+        # "T*u (blend된 u를 월드로 변환)" — 여기서 world로 변환한 값을 리턴해서 메모리 업데이트에 씀
+        warm_u_world = (1.0 - warm_beta) * mem_world_local + warm_beta * (T * u_tb)
+
+        u_norm = wp.length(u_tb)
         eps_U = friction_epsilon * dt
 
-        friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
-
+        friction_force, friction_hessian = compute_friction(
+            friction_coefficient,
+            -dEdD,
+            T,
+            u_tb,
+            eps_U,
+        )
 
         # fmt: off
         if wp.static("contact_force_hessian_vt" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1485,10 +1779,10 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
         collision_force_2 = collision_force * bs[2] # tri_c
         collision_force_3 = collision_force * bs[3] # v
 
-        contacts_normal_contact_force0 = collision_force_0
-        contacts_normal_contact_force1 = collision_force_1
-        contacts_normal_contact_force2 = collision_force_2
-        contacts_normal_contact_force3 = collision_force_3
+        contacts_normal_contact_force0_arr = collision_force_0
+        contacts_normal_contact_force1_arr = collision_force_1
+        contacts_normal_contact_force2_arr = collision_force_2
+        contacts_normal_contact_force3_arr = collision_force_3
 
         collision_hessian_0 = collision_hessian * bs[0] * bs[0]
         collision_hessian_1 = collision_hessian * bs[1] * bs[1]
@@ -1503,8 +1797,10 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
             collision_damping,
             dt,
         )
-        ncfs = contacts_normal_contact_force0
-        ncfm = contacts_normal_contact_force0
+        # ncfs = damping_force
+        # ncfm = damping_force
+        ncfs = contacts_normal_contact_force0_arr
+        ncfm = contacts_normal_contact_force0_arr
 
         collision_force_0 += damping_force + bs[0] * friction_force
         collision_hessian_0 += damping_hessian + bs[0] * bs[0] * friction_hessian
@@ -1518,9 +1814,12 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
             collision_damping,
             dt,
         )
-        ncfs += contacts_normal_contact_force1
-        if wp.length(contacts_normal_contact_force1) < wp.length(ncfm):
-            ncfm = contacts_normal_contact_force1
+        # ncfs += damping_force
+        # if wp.length(damping_force) < wp.length(ncfm):
+        #     ncfm = damping_force
+        ncfs += contacts_normal_contact_force1_arr
+        if wp.length(contacts_normal_contact_force1_arr) < wp.length(ncfm):
+            ncfm = contacts_normal_contact_force1_arr
 
         collision_force_1 += damping_force + bs[1] * friction_force
         collision_hessian_1 += damping_hessian + bs[1] * bs[1] * friction_hessian
@@ -1534,9 +1833,12 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
             collision_damping,
             dt,
         )
-        ncfs += contacts_normal_contact_force2
-        if wp.length(contacts_normal_contact_force2) < wp.length(ncfm):
-            ncfm = contacts_normal_contact_force2
+        # ncfs += damping_force
+        # if wp.length(damping_force) < wp.length(ncfm):
+        #     ncfm = damping_force
+        ncfs += contacts_normal_contact_force2_arr
+        if wp.length(contacts_normal_contact_force2_arr) < wp.length(ncfm):
+            ncfm = contacts_normal_contact_force2_arr
         collision_force_2 += damping_force + bs[2] * friction_force
         collision_hessian_2 += damping_hessian + bs[2] * bs[2] * friction_hessian
 
@@ -1549,9 +1851,12 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
             collision_damping,
             dt,
         )
-        ncfs += contacts_normal_contact_force3
-        if wp.length(contacts_normal_contact_force3) < wp.length(ncfm):
-            ncfm = contacts_normal_contact_force3
+        # ncfs += damping_force
+        # if wp.length(damping_force) < wp.length(ncfm):
+        #     ncfm = damping_force
+        ncfs += contacts_normal_contact_force3_arr
+        if wp.length(contacts_normal_contact_force3_arr) < wp.length(ncfm):
+            ncfm = contacts_normal_contact_force3_arr
         collision_force_3 += damping_force + bs[3] * friction_force
         collision_hessian_3 += damping_hessian + bs[3] * bs[3] * friction_hessian
 
@@ -1576,19 +1881,22 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
             ncfm,
 
 
-            contacts_normal_contact_force0,
-            contacts_normal_contact_force1,
-            contacts_normal_contact_force2,
-            contacts_normal_contact_force3,
+            contacts_normal_contact_force0_arr,
+            contacts_normal_contact_force1_arr,
+            contacts_normal_contact_force2_arr,
+            contacts_normal_contact_force3_arr,
             contacts_friction0,
             contacts_friction1,
             contacts_friction2,
-            contacts_friction3
+            contacts_friction3,
+            warm_u_world
         )
     else:
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-
+        warm_u_world = wp.vec3(0.0, 0.0, 0.0)
+        collision_normal = wp.vec3(0.0, 0.0, 0.0)
+        
         return (
             False,
             collision_force,
@@ -1615,6 +1923,7 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
             collision_force,
             collision_force,
             collision_force,
+            warm_u_world
         )
 
 
@@ -1626,11 +1935,8 @@ def compute_friction(mu: float, normal_contact_force: float, T: mat32, u: wp.vec
     Args:
         mu: Friction coefficient.
         normal_contact_force: normal contact force.
-        T: Transformation matrix (3x2 matrix). 2D 접선좌표를 3D 월드로 올리는 기저(열벡터가 t,b)
-        u: 2D displacement vector. 접선 평면에서의 누적 변위 혹은 이번 스텝에서의 접선 변위
-    Outputs:
-        force: 크기 3 벡터, 접선 마찰력(월드)
-        hessian: 3*3 matrix, 선형화(뉴턴/implicit에 쓰기 위한)
+        T: Transformation matrix (3x2 matrix).
+        u: 2D displacement vector.
     """
     # Friction
     u_norm = wp.length(u)
@@ -2140,9 +2446,20 @@ def accumulate_contact_force_and_hessian(
     contact_body_pos: wp.array(dtype=wp.vec3),
     contact_body_vel: wp.array(dtype=wp.vec3),
     contact_normal: wp.array(dtype=wp.vec3),
+    # friction memory
+    fric_mem_world: wp.array(dtype=wp.vec3),
+    fric_mem_n: wp.array(dtype=wp.vec3),
+    use_ws: bool,
+    reset_cos: float,
+    warm_beta: float,
+
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
+    # friction accumulation
+    fric_accum_world: wp.array(dtype=wp.vec3),
+    fric_accum_n: wp.array(dtype=wp.vec3),
+    fric_accum_cnt: wp.array(dtype=wp.int32),
 ):
     t_id = wp.tid()
     collision_info = collision_info_array[0]
@@ -2166,7 +2483,7 @@ def accumulate_contact_force_and_hessian(
                 c_e1_v1 = particle_colors[e1_v1]
                 c_e1_v2 = particle_colors[e1_v2]
                 if c_e1_v1 == current_color or c_e1_v2 == current_color:
-                    has_contact, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1 = (
+                    has_contact, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1, warm_u_world_0, warm_u_world_1, collision_normal = (
                         evaluate_edge_edge_contact_2_vertices(
                             e1_idx,
                             e2_idx,
@@ -2180,6 +2497,11 @@ def accumulate_contact_force_and_hessian(
                             friction_epsilon,
                             dt,
                             edge_edge_parallel_epsilon,
+                            use_ws,
+                            fric_mem_world,
+                            fric_mem_n,
+                            reset_cos,
+                            warm_beta,
                         )
                     )
 
@@ -2188,9 +2510,15 @@ def accumulate_contact_force_and_hessian(
                         if c_e1_v1 == current_color:
                             wp.atomic_add(particle_forces, e1_v1, collision_force_0)
                             wp.atomic_add(particle_hessians, e1_v1, collision_hessian_0)
+                            wp.atomic_add(fric_accum_world, e1_v1, warm_u_world_0)  # (함수 리턴 형태에 맞게)
+                            wp.atomic_add(fric_accum_n, e1_v1, collision_normal)
+                            wp.atomic_add(fric_accum_cnt, e1_v1, 1)
                         if c_e1_v2 == current_color:
                             wp.atomic_add(particle_forces, e1_v2, collision_force_1)
                             wp.atomic_add(particle_hessians, e1_v2, collision_hessian_1)
+                            wp.atomic_add(fric_accum_world, e1_v2, warm_u_world_1)
+                            wp.atomic_add(fric_accum_n, e1_v2, collision_normal)
+                            wp.atomic_add(fric_accum_cnt, e1_v2, 1)
             collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
 
     # process vertex-triangle collisions
@@ -2229,6 +2557,8 @@ def accumulate_contact_force_and_hessian(
                         collision_hessian_1,
                         collision_hessian_2,
                         collision_hessian_3,
+                        warm_u_world,
+                        collision_normal
                     ) = evaluate_vertex_triangle_collision_force_hessian_4_vertices(
                         particle_idx,
                         tri_idx,
@@ -2241,6 +2571,11 @@ def accumulate_contact_force_and_hessian(
                         friction_mu,
                         friction_epsilon,
                         dt,
+                        use_ws,
+                        fric_mem_world,
+                        fric_mem_n,
+                        reset_cos,
+                        warm_beta,
                     )
 
                     if has_contact:
@@ -2248,6 +2583,9 @@ def accumulate_contact_force_and_hessian(
                         if c_v == current_color:
                             wp.atomic_add(particle_forces, particle_idx, collision_force_3)
                             wp.atomic_add(particle_hessians, particle_idx, collision_hessian_3)
+                            wp.atomic_add(fric_accum_world, particle_idx, warm_u_world)
+                            wp.atomic_add(fric_accum_n, particle_idx, collision_normal)
+                            wp.atomic_add(fric_accum_cnt, particle_idx, wp.int32(1))
 
                         # tri_a
                         if c_tri_a == current_color:
@@ -2373,7 +2711,17 @@ def accumulate_contact_force_and_hessian_log_collision(
     contacts_friction2: wp.array(dtype=wp.vec3),
     contacts_friction3: wp.array(dtype=wp.vec3),
     contacts_v_list: wp.array(dtype=wp.vec4i),
-    contacts_mu: wp.array(dtype=float)
+    contacts_mu: wp.array(dtype=float),
+    # friction memory
+    fric_mem_world: wp.array(dtype=wp.vec3),
+    fric_mem_n: wp.array(dtype=wp.vec3),
+    # friction accumulation
+    fric_accum_world: wp.array(dtype=wp.vec3),
+    fric_accum_n: wp.array(dtype=wp.vec3),
+    fric_accum_cnt: wp.array(dtype=wp.int32),
+    use_ws: bool,
+    reset_cos: float,
+    warm_beta: float,
 ):
     t_id = wp.tid()
     collision_info = collision_info_array[0]
@@ -2408,14 +2756,10 @@ def accumulate_contact_force_and_hessian_log_collision(
                         normal_contact_force_sum,
                         normal_contact_force_min,
 
-                        normal_contact_force0,
-                        normal_contact_force1,
-                        normal_contact_force2,
-                        normal_contact_force3,
-                        friction0,
-                        friction1,
-                        friction2,
-                        friction3
+                        ncf0, ncf1, ncf2, ncf3,
+                        fr0, fr1, fr2, fr3,
+                        contacts_warm_u_world_1,
+                        contacts_warm_u_world_2,
                     ) = (
                         evaluate_edge_edge_contact_2_vertices_log_collision(
                             e1_idx,
@@ -2430,6 +2774,11 @@ def accumulate_contact_force_and_hessian_log_collision(
                             friction_epsilon,
                             dt,
                             edge_edge_parallel_epsilon,
+                            use_ws,
+                            fric_mem_world,
+                            fric_mem_n,
+                            reset_cos,
+                            warm_beta,
                         )
                     )
 
@@ -2437,15 +2786,17 @@ def accumulate_contact_force_and_hessian_log_collision(
                         # logging
                         index = wp.atomic_add(collision_counter, 0, 1)
                         if index < collision_counter[0]:
-                            contacts_index[index] = index
+                            # contacts_index[index] = index
+                            contacts_index[index] = e1_idx
                             contacts_is_self_col[index] = True
                             contacts_is_body_cloth_col[index] = False
                             contacts_is_vt_col[index] = False
                             contacts_is_ee_col[index] = True
                             contacts_vid[index] = -1
                             contacts_fid[index] = -1
-                            contacts_eid1[index] = e1_v1
-                            contacts_eid2[index] = e1_v2
+                            # edge-edge contact 에서 선 index 대신 vertex indices 기록
+                            contacts_eid1[index] = e1_idx
+                            contacts_eid2[index] = e2_idx
                             contacts_T[index] = T[:,0]
                             contacts_B[index] = T[:,1]
                             contacts_collision_normal[index] = collision_normal
@@ -2456,16 +2807,19 @@ def accumulate_contact_force_and_hessian_log_collision(
                             contacts_normal_contact_force_sum[index] = normal_contact_force_sum
                             contacts_normal_contact_force_min[index] = normal_contact_force_min
 
-                            contacts_normal_contact_force0[index] = normal_contact_force0
-                            contacts_normal_contact_force1[index] = normal_contact_force1
-                            contacts_normal_contact_force2[index] = normal_contact_force2
-                            contacts_normal_contact_force3[index] = normal_contact_force3
-                            contacts_friction0[index] = friction0
-                            contacts_friction1[index] = friction1
-                            contacts_friction2[index] = friction2
-                            contacts_friction3[index] = friction3
+                            contacts_normal_contact_force0[index] = ncf0
+                            contacts_normal_contact_force1[index] = ncf1
+                            contacts_normal_contact_force2[index] = ncf2
+                            contacts_normal_contact_force3[index] = ncf3
+                            contacts_friction0[index] = fr0
+                            contacts_friction1[index] = fr1
+                            contacts_friction2[index] = fr2
+                            contacts_friction3[index] = fr3
 
-                            contacts_v_list[index] = wp.vec4i(e1_v1, e1_v2, 0, 0)
+                            # contacts_v_list[index] = wp.vec4i(e1_v1, e1_v2, 0, 0)
+                            e2_v1 = edge_indices[e2_idx, 2]
+                            e2_v2 = edge_indices[e2_idx, 3]
+                            contacts_v_list[index] = wp.vec4i(e1_v1, e1_v2, e2_v1, e2_v2)
                             contacts_mu[index] = friction_mu
 
 
@@ -2473,9 +2827,15 @@ def accumulate_contact_force_and_hessian_log_collision(
                         if c_e1_v1 == current_color:
                             wp.atomic_add(particle_forces, e1_v1, collision_force_0)
                             wp.atomic_add(particle_hessians, e1_v1, collision_hessian_0)
+                            wp.atomic_add(fric_accum_world, e1_v1, contacts_warm_u_world_1)  # (함수 리턴 형태에 맞게)
+                            wp.atomic_add(fric_accum_n, e1_v1, collision_normal)
+                            wp.atomic_add(fric_accum_cnt, e1_v1, 1)
                         if c_e1_v2 == current_color:
                             wp.atomic_add(particle_forces, e1_v2, collision_force_1)
                             wp.atomic_add(particle_hessians, e1_v2, collision_hessian_1)
+                            wp.atomic_add(fric_accum_world, e1_v2, contacts_warm_u_world_2)
+                            wp.atomic_add(fric_accum_n, e1_v2, collision_normal)
+                            wp.atomic_add(fric_accum_cnt, e1_v2, 1)
             collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
 
     # process vertex-triangle collisions
@@ -2523,14 +2883,15 @@ def accumulate_contact_force_and_hessian_log_collision(
                         normal_contact_force_sum,
                         normal_contact_force_min,
 
-                        normal_contact_force0,
-                        normal_contact_force1,
-                        normal_contact_force2,
-                        normal_contact_force3,
-                        friction0,
-                        friction1,
-                        friction2,
-                        friction3
+                        ncf0,
+                        ncf1,
+                        ncf2,
+                        ncf3,
+                        fr0,
+                        fr1,
+                        fr2,
+                        fr3,
+                        warm_u_world,
                     ) = evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
                         particle_idx,
                         tri_idx,
@@ -2543,13 +2904,19 @@ def accumulate_contact_force_and_hessian_log_collision(
                         friction_mu,
                         friction_epsilon,
                         dt,
+                        use_ws,
+                        fric_mem_world,
+                        fric_mem_n,
+                        reset_cos,
+                        warm_beta,
                     )
                     
                     if has_contact:
                         # logging
                         index = wp.atomic_add(collision_counter, 0, 1)
                         if index < collision_counter[0]:
-                            contacts_index[index] = index
+                            # contacts_index[index] = index
+                            contacts_index[index] = particle_idx
                             contacts_is_self_col[index] = True
                             contacts_is_body_cloth_col[index] = False
                             contacts_is_vt_col[index] = True
@@ -2568,14 +2935,14 @@ def accumulate_contact_force_and_hessian_log_collision(
                             contacts_normal_contact_force_sum[index] = normal_contact_force_sum
                             contacts_normal_contact_force_min[index] = normal_contact_force_min
 
-                            contacts_normal_contact_force0[index] = normal_contact_force0
-                            contacts_normal_contact_force1[index] = normal_contact_force1
-                            contacts_normal_contact_force2[index] = normal_contact_force2
-                            contacts_normal_contact_force3[index] = normal_contact_force3
-                            contacts_friction0[index] = friction0
-                            contacts_friction1[index] = friction1
-                            contacts_friction2[index] = friction2
-                            contacts_friction3[index] = friction3
+                            contacts_normal_contact_force0[index] = ncf0
+                            contacts_normal_contact_force1[index] = ncf1
+                            contacts_normal_contact_force2[index] = ncf2
+                            contacts_normal_contact_force3[index] = ncf3
+                            contacts_friction0[index] = fr0
+                            contacts_friction1[index] = fr1
+                            contacts_friction2[index] = fr2
+                            contacts_friction3[index] = fr3
 
                             contacts_v_list[index] = wp.vec4i(tri_a, tri_b, tri_c, particle_idx)
                             contacts_mu[index] = friction_mu
@@ -2583,6 +2950,9 @@ def accumulate_contact_force_and_hessian_log_collision(
                         if c_v == current_color:
                             wp.atomic_add(particle_forces, particle_idx, collision_force_3)
                             wp.atomic_add(particle_hessians, particle_idx, collision_hessian_3)
+                            wp.atomic_add(fric_accum_world, particle_idx, warm_u_world)
+                            wp.atomic_add(fric_accum_n, particle_idx, collision_normal)
+                            wp.atomic_add(fric_accum_cnt, particle_idx, 1)
 
                         # tri_a
                         if c_tri_a == current_color:
@@ -2620,14 +2990,8 @@ def accumulate_contact_force_and_hessian_log_collision(
             eps_u,
             friction_force,
 
-            normal_contact_force0,
-            normal_contact_force1,
-            normal_contact_force2,
-            normal_contact_force3,
-            friction0,
-            friction1,
-            friction2,
-            friction3,
+            ncf0, ncf1, ncf2, ncf3,
+            fr0, fr1, fr2, fr3,
             mu
             ) = evaluate_body_particle_contact_log_collision(
                 particle_idx,
@@ -2654,7 +3018,8 @@ def accumulate_contact_force_and_hessian_log_collision(
 
             index = wp.atomic_add(collision_counter, 0, 1)
             if index < collision_counter[0]:
-                contacts_index[index] = index
+                # contacts_index[index] = index
+                contacts_index[index] = t_id
                 contacts_is_self_col[index] = False
                 contacts_is_body_cloth_col[index] = True
                 contacts_is_vt_col[index] = False # both false means we don't know
@@ -2670,17 +3035,17 @@ def accumulate_contact_force_and_hessian_log_collision(
                 contacts_eps_u[index] = eps_u
                 contacts_is_slip[index] = u_norm > eps_u
                 contacts_friction_force[index] = friction_force
-                contacts_normal_contact_force_sum[index] = normal_contact_force0
-                contacts_normal_contact_force_min[index] = normal_contact_force0
+                contacts_normal_contact_force_sum[index] = normal_contact_force_sum
+                contacts_normal_contact_force_min[index] = normal_contact_force_min
 
-                contacts_normal_contact_force0[index] = normal_contact_force0
-                contacts_normal_contact_force1[index] = normal_contact_force1
-                contacts_normal_contact_force2[index] = normal_contact_force2
-                contacts_normal_contact_force3[index] = normal_contact_force3
-                contacts_friction0[index] = friction0
-                contacts_friction1[index] = friction1
-                contacts_friction2[index] = friction2
-                contacts_friction3[index] = friction3
+                contacts_normal_contact_force0[index] = ncf0
+                contacts_normal_contact_force1[index] = ncf1
+                contacts_normal_contact_force2[index] = ncf2
+                contacts_normal_contact_force3[index] = ncf3
+                contacts_friction0[index] = fr0
+                contacts_friction1[index] = fr1
+                contacts_friction2[index] = fr2
+                contacts_friction3[index] = fr3
 
                 contacts_v_list[index] = wp.vec4i(particle_idx, 0, 0, 0)
                 contacts_mu[index] = mu

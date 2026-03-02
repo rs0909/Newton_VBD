@@ -40,6 +40,7 @@ from .particle_vbd_kernels_edit import (
     build_vertex_n_ring_tris_collision_filter,
     compute_particle_conservative_bound,
     copy_particle_positions_back,
+    finalize_friction_memory,
     # Adjacency building kernels
     count_num_adjacent_edges,
     count_num_adjacent_faces,
@@ -168,7 +169,6 @@ class SolverVBD(SolverBase):
         rigid_enable_dahl_friction: bool = False,  # Cable bending plasticity/hysteresis
         rigid_dahl_eps_max: float | wp.array = 0.5,  # Dahl: max persistent strain
         rigid_dahl_tau: float | wp.array = 1.0,  # Dahl: memory decay length
-
         ogc_contact: bool = False,
     ):
         """
@@ -260,6 +260,17 @@ class SolverVBD(SolverBase):
         self.iterations = iterations
         data_collector.record_to_scene("iter_per_substep", self.iterations)
         self.friction_epsilon = friction_epsilon
+
+        self.fric_mem_world = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        self.fric_mem_n = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        self.fric_accum_world = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        self.fric_accum_n = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        self.fric_accum_cnt = wp.zeros(model.particle_count, dtype=int, device=model.device)
+        self.use_ws_friction_model = True
+        self.warm_beta = 0.9
+        self.reset_cos = 0.5  # cos(60 degrees)
+        self.ws_alpha = 0.9
+        self.ws_decay = 0.98
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
@@ -1281,6 +1292,7 @@ class SolverVBD(SolverBase):
                                 contacts.soft_contact_particle,
                                 contacts.soft_contact_count,
                                 contacts.soft_contact_max,
+                                # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
                                 self.body_particle_contact_penalty_k,
                                 self.body_particle_contact_material_kd,
                                 self.body_particle_contact_material_mu,
@@ -1298,6 +1310,7 @@ class SolverVBD(SolverBase):
                                 self.collision_counter,
                             ],
                             outputs=[
+                                # outputs: particle force and hessian
                                 self.particle_forces,
                                 self.particle_hessians,
 
@@ -1329,7 +1342,17 @@ class SolverVBD(SolverBase):
                                 self.contacts_friction2,
                                 self.contacts_friction3,
                                 self.contacts_v_list,
-                                self.contacts_mu
+                                self.contacts_mu,
+                                # friction memory
+                                self.fric_mem_world, 
+                                self.fric_mem_n,
+                                # friction accumulation
+                                self.fric_accum_world, 
+                                self.fric_accum_n, 
+                                self.fric_accum_cnt,
+                                self.use_ws_friction_model,
+                                self.reset_cos,
+                                self.warm_beta,
                             ],
                             device=self.device,
                             max_blocks=model.device.sm_count,
@@ -1359,6 +1382,7 @@ class SolverVBD(SolverBase):
                                 contacts.soft_contact_particle,
                                 contacts.soft_contact_count,
                                 contacts.soft_contact_max,
+                                # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
                                 self.body_particle_contact_penalty_k,
                                 self.body_particle_contact_material_kd,
                                 self.body_particle_contact_material_mu,
@@ -1372,10 +1396,19 @@ class SolverVBD(SolverBase):
                                 contacts.soft_contact_body_pos,
                                 contacts.soft_contact_body_vel,
                                 contacts.soft_contact_normal,
+                                # friction memory
+                                self.fric_mem_world, 
+                                self.fric_mem_n,
+                                self.use_ws_friction_model,
+                                self.reset_cos,
+                                self.warm_beta,
                             ],
                             outputs=[
                                 self.particle_forces,
                                 self.particle_hessians,
+                                self.fric_accum_world, 
+                                self.fric_accum_n, 
+                                self.fric_accum_cnt
                             ],
                             device=self.device,
                             max_blocks=model.device.sm_count,
@@ -1583,6 +1616,23 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
         # end color loop
+
+        if self.use_ws_friction_model and iter_num == max_iter_num:
+            wp.launch(
+                kernel=finalize_friction_memory,
+                dim=model.particle_count,
+                inputs=[
+                    self.fric_mem_world,
+                    self.fric_mem_n,
+                    self.fric_accum_world,
+                    self.fric_accum_n,
+                    self.fric_accum_cnt,
+                    self.ws_alpha,   # 예: warm_beta와 동일하게 써도 됨
+                    self.ws_decay,   # 예: 0.98
+                ],
+                device=self.device,
+            )
+
         if not data_collector.is_log_nothing():
             data_collector.frame_timer.stop()
             total_force = (self.particle_forces + self.stvk_forces).numpy().reshape(-1, 3)
@@ -1625,6 +1675,10 @@ class SolverVBD(SolverBase):
                 )
             data_collector.frame_timer.start()
         # print(self.contacts_T1, "<- t1")
+        if self.use_ws_friction_model and iter_num == max_iter_num:
+            self.fric_accum_world.zero_()
+            self.fric_accum_n.zero_()
+            self.fric_accum_cnt.zero_()
 
     def solve_rigid_body_iteration(self, state_in: State, state_out: State, contacts: Contacts, dt: float):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).

@@ -61,3 +61,6 @@ docs/_static/viser/
 data/
 
 .DS_*
+# data (too large for git)
+data/
+*.pkl

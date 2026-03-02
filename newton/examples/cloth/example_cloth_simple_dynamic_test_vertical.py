@@ -37,12 +37,12 @@ from pxr import Usd
 import newton
 import newton.examples
 import newton.usd
-from newton import ParticleFlags
+from newton import ParticleFlags, DynamicMesh
 
 
 class Example:
     def __init__(self, viewer, args=None):
-        data_collector.set_record_name('BallWith5Layers_again')
+        data_collector.set_record_name('simple_dynamic_test')
         # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -87,10 +87,12 @@ class Example:
             wp.vec3(0.8, 0.8, 0.2),  # Yellow  
             wp.vec3(0.8, 0.2, 0.8),  # Magenta  
         ], dtype=wp.vec3)  
-        for i in range(0,5):
+        for i in range(0,1):
             scene.add_cloth_mesh( # yk: how to add cloth mesh is written here
-                pos=wp.vec3(0.0, 0.0, 1.2+i*0.05),
-                rot=wp.quat_from_axis_angle(wp.vec3(1, 0, 0), wp.pi / 2),
+                pos=wp.vec3(0.0, 0.0, 1.7+i*0.05),
+                # rot=wp.quat_from_axis_angle(wp.vec3(0, 0, 1), wp.pi / 2), # YZ plane
+                # rot=wp.quat_identity(), # XZ plane
+                rot=wp.quat_from_axis_angle(wp.vec3(0,0,1), wp.pi/4), # X=Y plane
                 scale=0.01,
                 vertices=vertices,
                 indices=mesh_indices,
@@ -105,11 +107,23 @@ class Example:
         # sphere
         print(len(vertices), "<<<<<<<<<<<<< number of points on each cloth")
         
-        scene.add_shape_sphere(
-            body=-1,
-            xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.6), q=wp.quat_identity()),
-            radius=0.5
-        )
+        # scene.add_shape_sphere(
+        #     body=-1,
+        #     xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.6), q=wp.quat_identity()),
+        #     radius=0.5
+        # )
+        # v = np.array([[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]])
+        # f = np.array([[0, 1, 2], [0, 2, 3]])
+        # self.dmesh = DynamicMesh(v, f)
+        # scene.add_shape_mesh(
+        #     body=scene.add_body(),
+        #     xform=wp.transform(
+        #         p=wp.vec3(0,0,0),
+        #         q=wp.quat_identity(),
+        #     ),
+        #     scale=wp.vec3(1,1,1),
+        #     mesh=self.dmesh,
+        # )
         # plane
         scene.add_ground_plane()
         scene.color()
@@ -125,6 +139,7 @@ class Example:
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
             particle_self_contact_margin=0.0035, # yk: this handles the entire contact margin. (= query radius)
+            integrate_with_external_rigid_solver=True,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -138,9 +153,9 @@ class Example:
         self.viewer.show_contacts = True
 
         # put graph capture into it's own function
-        if data_collector.is_log_nothing():
-            self.simulate()
-            self.capture()
+        # if data_collector.is_log_nothing():
+        #     self.simulate()
+        #     self.capture()
 
     def capture(self):
         self.graph = None
@@ -151,6 +166,17 @@ class Example:
 
     def simulate(self):
         # yk: how this `collide` function works?
+        
+        name = f"/geometry/mesh_0"
+        # v = self.dmesh.mesh.points + wp.vec3(0.0,0.0,0.05)
+        # print(v)
+        # points = wp.array(v, dtype=wp.vec3)
+        # indices = None
+        # normals = None
+        # uvs = None
+        # viewer.update_mesh(name, points, indices, normals, uvs)
+        # self.dmesh.update_vertices(points)
+
         self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
         if(not data_collector.is_log_nothing()):
             data_collector.record_to_frame("body_cloth_col_count", self.contacts.soft_contact_count.numpy()[0])
@@ -173,13 +199,13 @@ class Example:
         data_collector.frame_start(self.frame_count)
         data_collector.frame_timer.clear_start()
 
-        if data_collector.is_log_nothing():
-            if self.graph:
-                wp.capture_launch(self.graph)
-            else:
-                self.simulate()
-        else:
-            self.simulate() # no graph capturing when log something
+        # if data_collector.is_log_nothing():
+        #     if self.graph:
+        #         wp.capture_launch(self.graph)
+        #     else:
+        #         self.simulate()
+        # else:
+        self.simulate() # no graph capturing when log something
 
         # total_time_end = time.perf_counter()
         # data_collector.record_to_frame("total_time", total_time_end-total_time_start)
@@ -216,19 +242,6 @@ class Example:
 
 
 if __name__ == "__main__":
-    from newton import data_collector
-    import os, time
-
-    # 1) 로그 모드 켜기 (충돌 로깅이면)
-    data_collector.log_mode = 1 #data_collector.LOG_COLLISION_INFO  # 또는 LOG_PERFORMANCE
-
-    # 2) 저장 폴더 + run 이름 만들기
-    out_dir = "/home/user/Desktop/newton/newton/logs"
-    os.makedirs(out_dir, exist_ok=True)
-
-    run_name = f"{out_dir}/cloth5layer_{time.strftime('%Y%m%d_%H%M%S')}"
-    data_collector.set_record_name(run_name)
-
     # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
     parser.set_defaults(num_frames=300)

@@ -279,6 +279,7 @@ class Example:
         if hasattr(self.viewer, "renderer"):
             self.viewer.set_world_offsets(wp.vec3(1.5, 1.5, 0.0))
 
+        self.simulate()
         self.capture()
 
         self.episode_steps = 0

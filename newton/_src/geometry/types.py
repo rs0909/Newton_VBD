@@ -313,3 +313,38 @@ class Mesh:
                 (tuple(np.array(self.vertices).flatten()), tuple(np.array(self.indices).flatten()), self.is_solid)
             )
         return self._cached_hash
+
+class DynamicMesh(Mesh):
+    def __init__(self, vertices, indices):
+        super().__init__(vertices, indices)
+        self.simulation_mesh = None 
+        self.points_buffer = None    
+        self.velocities_buffer = None
+
+    def finalize(self, device=None, requires_grad=False):
+        mesh_id = super().finalize(device, requires_grad)
+
+        self.simulation_mesh = self.mesh 
+
+        self.points_buffer = self.mesh.points 
+        self.velocities_buffer = self.mesh.velocities
+        print()
+        print(f">>> DynamicMesh(mesh_id: {mesh_id}) Finalized: Buffer ID {self.points_buffer.ptr} saved.")
+        print()
+        return mesh_id
+
+    def update_vertices(self, new_positions, dt, analytic_velocities=None):
+        if isinstance(new_positions, wp.array):
+            if analytic_velocities is None:
+                wp.copy(dest=self.velocities_buffer, src=(new_positions-self.points_buffer)/dt)
+            else:
+                wp.copy(dest=self.velocities_buffer, src=analytic_velocities)
+            # print(self.velocities_buffer)w
+            wp.copy(dest=self.points_buffer, src=new_positions)
+        else:
+            print()
+            print(">>>>>>>>>>>>> NUMPY NOT SUPPORT <<<<<<<<<<<<<<<<<<<<")
+            print()
+        
+        self.simulation_mesh.refit()
+    

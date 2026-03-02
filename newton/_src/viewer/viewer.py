@@ -310,11 +310,18 @@ class ViewerBase:
             return
 
         # compute shape transforms and render
+
+        if self.model_changed:
+            print()
+            print(f"In log_state, there are {len(self._shape_instances.values())} shape instances.")
         for shapes in self._shape_instances.values():
             visible = self._should_show_shape(shapes.flags, shapes.static)
 
             if visible:
                 shapes.update(state, world_offsets=self.world_offsets)
+            
+            if self.model_changed:
+                print(f"- {shapes.name}")
 
             self.log_instances(
                 shapes.name,
@@ -376,6 +383,8 @@ class ViewerBase:
         self._log_joints(state)
         self._log_com(state)
 
+        if self.model_changed:
+            print()
         self.model_changed = False
 
     def log_contacts(self, contacts, state):
@@ -879,6 +888,9 @@ class ViewerBase:
             raise ValueError(f"Unsupported geo_type for ensure_geometry: {geo_type}")
 
         mesh_path = f"/geometry/{base_name}_{len(self._geometry_cache)}"
+        print()
+        print(f">>>>>>>>>>>>>>>>> {mesh_path} populated by viewer")
+        print()
         self.log_geo(
             mesh_path,
             int(geo_type),
@@ -1287,6 +1299,8 @@ class ViewerBase:
 
     def _log_triangles(self, state):
         if self.model.tri_count:
+            if self.model_changed:
+                print("- triangles")
             self.log_mesh(
                 "/model/triangles",
                 state.particle_q,
@@ -1302,6 +1316,8 @@ class ViewerBase:
                 colors = wp.full(shape=self.model.particle_count, value=wp.vec3(0.7, 0.6, 0.4), device=self.device)
             else:
                 colors = None
+            if self.model_changed:
+                print("- particles")
 
             self.log_points(
                 name="/model/particles",

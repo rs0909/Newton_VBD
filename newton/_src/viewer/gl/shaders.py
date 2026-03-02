@@ -318,11 +318,11 @@ void main()
     vec3 color = ambient + (1.0 - shadow) * spotlightAttenuation * (diffuse + spec);
 
     // fog
-    float dist = length(FragPos - view_pos);
-    float fog_start = 20.0;
-    float fog_end   = 200.0;
-    float fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    color = mix(color, pow(fogColor, vec3(2.2)), fog_factor);
+    //float dist = length(FragPos - view_pos);
+    //float fog_start = 20.0;
+    //float fog_end   = 200.0;
+    //float fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+    //color = mix(color, pow(fogColor, vec3(2.2)), fog_factor);
 
     // gamma correction (sRGB)
     color = pow(color, vec3(1.0 / 2.2));

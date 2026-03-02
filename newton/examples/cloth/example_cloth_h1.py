@@ -252,6 +252,7 @@ class Example:
     def _force_update_targets(self):
         # key infos
         key_time = [2.0, 6.0, 10.0]  # second
+        # key_time = [0.5, 1.0, 1.5]  # second
         target_pos = [
             [wp.vec3(0.16, 0.65, 1.71), wp.vec3(0.28, -0.50, 1.19)],  # key 0
             [wp.vec3(0.12, 0.34, 0.99), wp.vec3(0.14, -0.35, 0.97)],  # key 1

@@ -911,6 +911,7 @@ def evaluate_body_particle_contact_log_collision(
     if penetration_depth > 0.0:
         body_contact_force_norm = penetration_depth * body_particle_contact_ke
         body_contact_force = n * body_contact_force_norm
+        normal_contact_force = body_contact_force
         body_contact_hessian = body_particle_contact_ke * wp.outer(n, n)
 
         # Use the larger of body-particle friction and shape material friction
@@ -959,6 +960,7 @@ def evaluate_body_particle_contact_log_collision(
         body_contact_hessian = body_contact_hessian + friction_hessian
     else:
         body_contact_force = wp.vec3(0.0, 0.0, 0.0)
+        normal_contact_force = wp.vec3(0.0,0.0,0.0)
         body_contact_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         friction_force = wp.vec3(0.0, 0.0, 0.0)
         mu = 0.0
@@ -975,7 +977,7 @@ def evaluate_body_particle_contact_log_collision(
             eps_u,
             friction_force,
             
-            body_contact_force,
+            normal_contact_force,
             empty,
             empty,
             empty,
