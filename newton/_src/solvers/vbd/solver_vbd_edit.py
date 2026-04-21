@@ -26,7 +26,7 @@ import warp as wp
 from ...core.types import override
 from ...sim import Contacts, Control, JointType, Model, State
 from ..solver import SolverBase
-from .particle_vbd_kernels_edit import (
+from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     ParticleForceElementAdjacencyInfo,

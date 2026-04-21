@@ -26,7 +26,7 @@ import warp as wp
 from ...core.types import override
 from ...sim import Contacts, Control, JointType, Model, State
 from ..solver import SolverBase
-from .particle_vbd_kernels_edit import (
+from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     ParticleForceElementAdjacencyInfo,
@@ -55,6 +55,8 @@ from .particle_vbd_kernels_edit import (
     solve_trimesh_with_self_contact_penetration_free,
     solve_trimesh_with_self_contact_penetration_free_tile,
     update_velocity,
+    assign_pair_ids_vf_from_vt_list,
+    assign_pair_ids_ee_from_collision_info,
 )
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
@@ -170,6 +172,8 @@ class SolverVBD(SolverBase):
         rigid_dahl_tau: float | wp.array = 1.0,  # Dahl: memory decay length
 
         ogc_contact: bool = False,
+
+        particle_uvs: np.ndarray | None = None, 
     ):
         """
         Args:
@@ -265,6 +269,12 @@ class SolverVBD(SolverBase):
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
+
+        if particle_uvs is not None:
+            self.particle_uv = wp.array(particle_uvs, dtype=wp.vec2, device=self.device)
+        else:
+            self.particle_uv = None
+        self.transport_eps = 1e-8
 
         # Initialize particle system
         self._init_particle_system(
@@ -405,7 +415,6 @@ class SolverVBD(SolverBase):
         self.particle_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.stvk_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.particle_hessians = wp.zeros(self.model.particle_count, dtype=wp.mat33, device=self.device)
-
         if data_collector.is_log_collision():
             vt_contact_max = self.model.particle_count * particle_vertex_contact_buffer_size
             ee_contact_max = self.model.particle_count * particle_edge_contact_buffer_size
@@ -442,7 +451,31 @@ class SolverVBD(SolverBase):
             self.contacts_friction3 = wp.empty(self.all_collision_count, dtype=wp.vec3, device=self.device)
             self.contacts_v_list = wp.empty(self.all_collision_count, dtype=wp.vec4i, device=self.device)
             self.contacts_mu = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+        
+        self.ee_entry_pair_id = wp.empty(shape=(ee_contact_max,), dtype=wp.int32, device=self.device)
+        self.ee_pair_capacity = ee_contact_max          # Pmax
+        self.ee_hash_capacity = ee_contact_max * 4          # H = 4x Pmax
+        self.ee_max_probe = 64
+        self.ee_init_age = 8
 
+        self.ee_hash_keys = wp.zeros((self.ee_hash_capacity,), dtype=wp.uint64, device=self.device)
+        self.ee_hash_vals = wp.zeros((self.ee_hash_capacity,), dtype=wp.int32, device=self.device)
+        self.ee_pair_count = wp.zeros((1,), dtype=wp.int32, device=self.device)
+        self.ee_pair_t = wp.empty((self.ee_pair_capacity,), dtype=wp.vec3, device=self.device)
+        self.ee_pair_age = wp.zeros((self.ee_pair_capacity,), dtype=wp.int32, device=self.device)
+
+        self.vf_entry_pair_id = wp.empty(shape=(vt_contact_max,), dtype=wp.int32, device=self.device)
+        self.vf_pair_capacity = vt_contact_max          # Pmax
+        self.vf_hash_capacity = vt_contact_max * 4      # H = 4x Pmax
+        self.vf_max_probe = 64
+        self.vf_init_age = 8
+
+        self.vf_hash_keys = wp.zeros((self.ee_hash_capacity,), dtype=wp.uint64, device=self.device)
+        self.vf_hash_vals = wp.zeros((self.ee_hash_capacity,), dtype=wp.int32, device=self.device)
+        self.vf_pair_count = wp.zeros((1,), dtype=wp.int32, device=self.device)
+        self.vf_pair_t = wp.empty((self.ee_pair_capacity,), dtype=wp.vec3, device=self.device)
+        self.vf_pair_age = wp.zeros((self.ee_pair_capacity,), dtype=wp.int32, device=self.device)
+        
         # Validation
         if len(self.model.particle_color_groups) == 0:
             raise ValueError(
@@ -1240,6 +1273,72 @@ class SolverVBD(SolverBase):
                     col_detect_time_end = time.perf_counter()
                     data_collector.record_to_frame("col_detect_time", col_detect_time_end - col_detect_time_start)
                 
+                #### assign_pair_ids 커널이 들어가야
+                wp.launch(
+                    kernel=assign_pair_ids_ee_from_collision_info,
+                    dim=self.collision_evaluation_kernel_launch_size,
+                    inputs=[
+                        # collision info
+                        self.trimesh_collision_info,
+
+                        # geometry
+                        state_in.particle_q,
+                        model.edge_indices,
+                        self.particle_uv,
+
+                        # params
+                        0, 0,                           # layerA, layerB (self-contact면 둘 다 0)
+                        128, 128,                       # res_u, res_v
+                        self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+
+                        self.ee_hash_keys,
+                        self.ee_hash_vals,
+                        self.ee_pair_count,
+                        self.ee_pair_t,
+                        self.ee_pair_age,
+
+                        self.ee_hash_capacity,
+                        self.ee_pair_capacity,
+                        self.ee_max_probe,
+                        self.ee_init_age,
+
+                        self.ee_entry_pair_id,
+                    ],
+                    device=self.device,
+                    max_blocks=model.device.sm_count,
+                )
+                
+                wp.launch(
+                    kernel=assign_pair_ids_vf_from_vt_list,
+                    dim=self.collision_evaluation_kernel_launch_size,
+                    inputs=[
+                        self.trimesh_collision_info,
+
+                        state_in.particle_q,
+                        model.tri_indices,
+                        self.particle_uv,
+
+                        0, 0,           # layerA, layerB (self-contact)
+                        128, 128,       # res_u, res_v
+
+                        self.vf_hash_keys,   # 또는 EE와 같은 해시 테이블을 공유하면 self.ee_hash_keys로
+                        self.vf_hash_vals,
+                        self.vf_pair_count,
+                        self.vf_pair_t,
+                        self.vf_pair_age,
+                        self.vf_hash_capacity,
+                        self.vf_pair_capacity,
+                        self.vf_max_probe,
+                        self.vf_init_age,
+
+                        self.vf_entry_pair_id,
+                    ],
+                    device=self.device,
+                    max_blocks=model.device.sm_count,
+                )
+                
+                        
+                
             elif not data_collector.is_log_nothing():
                 data_collector.record_to_frame("col_detect_time", 0)
         elif not data_collector.is_log_nothing():
@@ -1257,7 +1356,7 @@ class SolverVBD(SolverBase):
             # Accumulate contact forces
             if self.particle_enable_self_contact:
                 if contacts is not None:
-                    if data_collector.is_log_collision() and iter_num == max_iter_num:
+                    if data_collector.is_log_collision() and iter_num == max_iter_num: # 마지막 iteration에서만 log
                         wp.launch(
                             kernel=accumulate_contact_force_and_hessian_log_collision,
                             dim=self.collision_evaluation_kernel_launch_size,
@@ -1297,6 +1396,14 @@ class SolverVBD(SolverBase):
                                 contacts.soft_contact_normal,
 
                                 self.collision_counter,
+                                # New
+                                self.ee_entry_pair_id,
+                                self.vf_entry_pair_id,
+                                self.transport_eps,
+                                self.ee_pair_t,
+                                self.vf_pair_t,
+                                iter_num,
+                                max_iter_num,
                             ],
                             outputs=[
                                 self.particle_forces,
@@ -1335,6 +1442,11 @@ class SolverVBD(SolverBase):
                             device=self.device,
                             max_blocks=model.device.sm_count,
                         )
+                        #### decay_pairs 커널이 들어갈 예정 - dormant 유지용 ####
+                        # pair_age를 줄이고(dead 처리)
+                        # last_seen가 갱신 안 된 pair는 age--
+                        # age==0이면 q reset
+                        # 마지막 substep 에서
                     else:
                         wp.launch(
                             kernel=accumulate_contact_force_and_hessian,
@@ -1373,6 +1485,14 @@ class SolverVBD(SolverBase):
                                 contacts.soft_contact_body_pos,
                                 contacts.soft_contact_body_vel,
                                 contacts.soft_contact_normal,
+                                # New
+                                self.ee_entry_pair_id,
+                                self.vf_entry_pair_id,
+                                self.transport_eps,
+                                self.ee_pair_t,
+                                self.vf_pair_t,
+                                iter_num,
+                                max_iter_num,
                             ],
                             outputs=[
                                 self.particle_forces,
@@ -2023,6 +2143,11 @@ class SolverVBD(SolverBase):
             dim=self.model.particle_count,
             device=self.device,
         )
+        #### assign_pair_ids 커널이 들어갈 예정 ####
+        # 입력: trimesh_collision_info, uv, edge_indices, tri_indices
+        # 출력:  contact_pair_id[contact_idx]
+        #       pair table 갱신: key insert/lookup, age=CONTACT, (optional) last_seen_iter 업데이트
+        # contact list 길이만큼 병렬로
 
     def rebuild_bvh(self, state: State):
         """This function will rebuild the BVHs used for detecting self-contacts using the input `state`.

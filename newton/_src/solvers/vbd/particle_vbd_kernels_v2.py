@@ -19,7 +19,7 @@ This module is intended to host the particle/soft-body specific parts of the
 VBD solver (cloth, springs, triangles, tets, particle contacts, etc.).
 
 The high-level :class:`SolverVBD` interface should remain in
-``solver_vbd_edit.py`` and call into functions defined here.
+``solver_vbd.py`` and call into functions defined here.
 """
 
 from __future__ import annotations
@@ -50,7 +50,8 @@ VBD_DEBUG_PRINTING_OPTIONS = {
 
 NUM_THREADS_PER_COLLISION_PRIMITIVE = 4
 TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE = 16
-
+RES_U = 128
+RES_V = 128
 
 class mat32(matrix(shape=(3, 2), dtype=float32)):
     pass
@@ -93,6 +94,162 @@ class ParticleForceElementAdjacencyInfo:
 
             return adjacency_gpu
 
+
+# --- simple 64-bit mix hash (splitmix64 style) ---
+@wp.func
+def hash_u64(x: wp.uint64) -> wp.uint64:
+    # SplitMix64-like mix (constants are standard)
+    x = x + wp.uint64(0x9E3779B97F4A7C15)
+    z = x
+    z = (z ^ (z >> wp.uint64(30))) * wp.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> wp.uint64(27))) * wp.uint64(0x94D049BB133111EB)
+    z = z ^ (z >> wp.uint64(31))
+    return z
+
+@wp.func
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    return wp.max(lo, wp.min(hi, x))
+
+@wp.func
+def make_nonzero_key(key: wp.uint64) -> wp.uint64:
+    # Ensure key != 0 because 0 means empty slot
+    return key | wp.uint64(1)
+
+# NOTE: Warp atomic CAS API naming may differ:
+# - Some versions: wp.atomic_cas(arr, idx, expected, desired) -> old_value
+# - Some versions: wp.atomic_compare_exchange(arr, idx, expected, desired) -> old_value
+# Replace wp.atomic_cas(...) below with your Warp atomic CAS call.
+@wp.func
+def hashmap_find_or_insert_pair_id(
+    key_in: wp.uint64,
+    hash_keys: wp.array(dtype=wp.uint64),
+    hash_vals: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_q: wp.array(dtype=wp.vec2),
+    pair_t: wp.array(dtype=wp.vec3),
+    pair_age: wp.array(dtype=wp.int32),
+    H: int,
+    Pmax: int,
+    init_t: wp.vec3,         # initial tangent axis (any vector not parallel to normal)
+    init_age: int,
+    max_probe: int,
+) -> int:
+    key = make_nonzero_key(key_in)
+
+    h = hash_u64(key)
+    start = int(h % wp.uint64(H))
+
+    for i in range(max_probe):
+        slot = start + i
+        if slot >= H:
+            slot -= H
+
+        k = hash_keys[slot]
+
+        # Empty slot -> try to claim
+        if k == wp.uint64(0):
+            # Attempt to atomically set key
+            # old = wp.atomic_cas(hash_keys, slot, 0, key)
+            old = wp.atomic_cas(hash_keys, slot, wp.uint64(0), key)  # <-- adjust API if needed
+            if old == wp.uint64(0):
+                # We won the insertion: allocate new pair_id
+                # pid = wp.atomic_add(pair_count, 0, 1)
+                pid = wp.atomic_add(pair_count, 0, 1)  # <-- adjust API if needed
+                if pid < Pmax:
+                    hash_vals[slot] = pid
+
+                    # initialize pair state
+                    pair_q[pid] = wp.vec2(0.0, 0.0)
+                    pair_t[pid] = init_t
+                    pair_age[pid] = init_age
+                    return pid
+                else:
+                    # Out of pair storage; mark slot invalid or just return -1
+                    # (Could also reset hash_keys[slot]=0, but racey; better to pre-size Pmax)
+                    return -1
+
+            # If CAS failed, someone else inserted concurrently; fall through and re-check
+
+        # Occupied slot: check key match
+        if k == key:
+            return hash_vals[slot]
+
+    # Hash table too full / probe limit reached
+    return -1
+
+@wp.func
+def uv_to_cell_id(uv: wp.vec2, res_u: int, res_v: int) -> int:
+    # clamp uv into [0, 1-eps] to avoid hitting res boundary
+    u = wp.max(0.0, wp.min(0.999999, uv[0]))
+    v = wp.max(0.0, wp.min(0.999999, uv[1]))
+
+    ix = int(u * float(res_u))
+    iy = int(v * float(res_v))
+
+    ix = clamp_int(ix, 0, res_u - 1)
+    iy = clamp_int(iy, 0, res_v - 1)
+    return ix + res_u * iy
+
+@wp.func
+def lerp_uv(a: wp.vec2, b: wp.vec2, t: float) -> wp.vec2:
+    return a + (b - a) * t
+
+@wp.func
+def ee_cells_from_edges(
+    e1: int,
+    e2: int,
+    s: float,
+    t: float,
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    uvs: wp.array(dtype=wp.vec2),
+    res_u: int,
+    res_v: int,
+) -> wp.vec2i:
+    # edge_indices[e,2], [e,3] are endpoints in your code
+    e1_v1 = edge_indices[e1, 2]
+    e1_v2 = edge_indices[e1, 3]
+    e2_v1 = edge_indices[e2, 2]
+    e2_v2 = edge_indices[e2, 3]
+
+    uv1 = lerp_uv(uvs[e1_v1], uvs[e1_v2], s)
+    uv2 = lerp_uv(uvs[e2_v1], uvs[e2_v2], t)
+
+    c1 = uv_to_cell_id(uv1, res_u, res_v)
+    c2 = uv_to_cell_id(uv2, res_u, res_v)
+
+    return wp.vec2i(c1, c2)
+
+@wp.func
+def canonicalize_pair(layerA: int, cellA: int, layerB: int, cellB: int):
+    # Ensure (A) <= (B) in lexicographic order to merge duplicates
+    if (layerA > layerB) or (layerA == layerB and cellA > cellB):
+        tmpL = layerA
+        tmpC = cellA
+        layerA = layerB
+        cellA = cellB
+        layerB = tmpL
+        cellB = tmpC
+    return layerA, cellA, layerB, cellB
+
+@wp.func
+def pack_pair_key(
+    type_id: int,   # 0:EE, 1:VF, 2:Body, etc.
+    layerA: int,
+    cellA: int,
+    layerB: int,
+    cellB: int,
+) -> wp.uint64:
+    # bit layout (example):
+    # [ type:4 | layerA:8 | cellA:16 | layerB:8 | cellB:16 | unused:12 ]
+    # cells need 14 bits for 128*128=16384, we store 16 for simplicity
+    la = wp.uint64(layerA & 0xFF)
+    lb = wp.uint64(layerB & 0xFF)
+    ca = wp.uint64(cellA & 0xFFFF)
+    cb = wp.uint64(cellB & 0xFFFF)
+    ty = wp.uint64(type_id & 0xF)
+
+    key = (ty << wp.uint64(60)) | (la << wp.uint64(52)) | (ca << wp.uint64(36)) | (lb << wp.uint64(28)) | (cb << wp.uint64(12))
+    return make_nonzero_key(key)
 
 @wp.func
 def get_vertex_num_adjacent_edges(adjacency: ParticleForceElementAdjacencyInfo, vertex: wp.int32):
@@ -726,6 +883,12 @@ def evaluate_edge_edge_contact(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    # NEW
+    pid: int,
+    pair_t: wp.array(dtype=wp.vec3),
+    transport_eps: float,
+    iter_num: int,
+    max_iter_num: int,
 ):
     r"""
     Returns the edge-edge contact force and hessian, including the friction force.
@@ -782,7 +945,15 @@ def evaluate_edge_edge_contact(
         c2_prev = pos_anchor[e2_v1] + (pos_anchor[e2_v2] - pos_anchor[e2_v1]) * t
 
         dx = (c1 - c1_prev) - (c2 - c2_prev)
-        axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+        # axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+        t_old = wp.vec3(1,0,0)
+        if pid >= 0:
+            t_old = pair_t[pid]
+        axis_1, axis_2 = tangent_transport(t_old, collision_normal, transport_eps)
+
+        # ✅ pair_t 업데이트(최소한 마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = axis_1
 
         T = mat32(
             axis_1[0],
@@ -792,7 +963,7 @@ def evaluate_edge_edge_contact(
             axis_1[2],
             axis_2[2],
         )
-
+        # u_eff = q_mem + u_sub
         u = wp.transpose(T) * dx
         eps_U = friction_epsilon * dt
 
@@ -804,7 +975,13 @@ def evaluate_edge_edge_contact(
             )
         # fmt: on
 
+        # ✅ transport만 테스트: u 그대로 사용
         friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+
+        # ✅ pair_t 업데이트(최소한 마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = axis_1
+
         friction_force = friction_force * v_bary
         friction_hessian = friction_hessian * v_bary * v_bary
 
@@ -854,8 +1031,14 @@ def evaluate_edge_edge_contact_2_vertices(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    # NEW
+    pid: int,
+    pair_t: wp.array(dtype=wp.vec3),
+    transport_eps: float,
+    iter_num: int,
+    max_iter_num: int,
 ):
-    r"""
+    r"""   
     Returns the edge-edge contact force and hessian, including the friction force.
     Args:
         v:
@@ -907,7 +1090,15 @@ def evaluate_edge_edge_contact_2_vertices(
         c2_prev = pos_anchor[e2_v1] + (pos_anchor[e2_v2] - pos_anchor[e2_v1]) * t
 
         dx = (c1 - c1_prev) - (c2 - c2_prev)
-        axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+
+        # axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+        t_old = wp.vec3(1,0,0)
+        if pid >= 0:
+            t_old = pair_t[pid]
+        axis_1, axis_2 = tangent_transport(t_old, collision_normal, transport_eps)
+        # ✅ pair_t 업데이트(최소한 마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = axis_1
 
         T = mat32(
             axis_1[0],
@@ -929,6 +1120,7 @@ def evaluate_edge_edge_contact_2_vertices(
             )
         # fmt: on
 
+        # ✅ transport만 테스트: u 그대로 사용
         friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
 
         # # fmt: off
@@ -991,6 +1183,12 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
     friction_epsilon: float,
     dt: float,
     edge_edge_parallel_epsilon: float,
+    # NEW
+    pid: int,
+    pair_t: wp.array(dtype=wp.vec3),
+    transport_eps: float,
+    iter_num: int,
+    max_iter_num: int,
 ):
     r"""
     Returns the edge-edge contact force and hessian, including the friction force.
@@ -1044,7 +1242,17 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
         c2_prev = pos_anchor[e2_v1] + (pos_anchor[e2_v2] - pos_anchor[e2_v1]) * t
 
         dx = (c1 - c1_prev) - (c2 - c2_prev) # c2 frame 기준 relative c1 disp
-        axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+        # OLD:
+        # axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+        # NEW: transport
+        t_old = wp.vec3(1,0,0)
+        if pid >= 0:
+            t_old = pair_t[pid]
+        axis_1, axis_2 = tangent_transport(t_old, collision_normal, transport_eps)
+
+        # ✅ pair_t 업데이트(최소한 마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = axis_1
 
         T = mat32(
             axis_1[0],
@@ -1066,8 +1274,13 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
             )
         # fmt: on
 
+        # ✅ transport만 테스트: u 그대로 사용
         friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
 
+        # ✅ pair_t 업데이트(최소한 마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = axis_1
+            
         # # fmt: off
         # if wp.static("contact_force_hessian_ee" in VBD_DEBUG_PRINTING_OPTIONS):
         #     wp.printf(
@@ -1138,9 +1351,10 @@ def evaluate_edge_edge_contact_2_vertices_log_collision(
                 contacts_friction0,
                 contacts_friction1,
                 wp.vec3(0.0, 0.0, 0.0),
-                wp.vec3(0.0, 0.0, 0.0)
+                wp.vec3(0.0, 0.0, 0.0),
         )
     else:
+        # no contact
         collision_force = wp.vec3(0.0, 0.0, 0.0)
         collision_hessian = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         
@@ -1271,6 +1485,12 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    # NEW
+    pid: int,
+    pair_t: wp.array(dtype=wp.vec3),
+    transport_eps: float,
+    iter_num: int,
+    max_iter_num: int,
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1302,8 +1522,17 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices(
         )
 
         dx = dx_v - (closest_p - closest_p_prev)
+        
+        # e0, e1 = build_orthonormal_basis(collision_normal)
+        # tangent transport
+        t_old = wp.vec3(1.0, 0.0, 0.0)
+        if pid >= 0:
+            t_old = pair_t[pid]
 
-        e0, e1 = build_orthonormal_basis(collision_normal)
+        e0, e1 = tangent_transport(t_old, collision_normal, transport_eps)
+        # 커밋(마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = e0
 
         T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
 
@@ -1421,6 +1650,12 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
     friction_coefficient: float,
     friction_epsilon: float,
     dt: float,
+    # NEW
+    pid: int,
+    pair_t: wp.array(dtype=wp.vec3),
+    transport_eps: float,
+    iter_num: int,
+    max_iter_num: int,
 ):
     a = pos[tri_indices[tri, 0]]
     b = pos[tri_indices[tri, 1]]
@@ -1453,10 +1688,18 @@ def evaluate_vertex_triangle_collision_force_hessian_4_vertices_log_collision(
 
         dx = dx_v - (closest_p - closest_p_prev) # relative dx
 
-        e0, e1 = build_orthonormal_basis(collision_normal)
+        # e0, e1 = build_orthonormal_basis(collision_normal)
+        # tangent transport
+        t_old = wp.vec3(1.0, 0.0, 0.0)
+        if pid >= 0:
+            t_old = pair_t[pid]
+
+        e0, e1 = tangent_transport(t_old, collision_normal, transport_eps)
+        # 커밋(마지막 iter에서만)
+        if pid >= 0 and iter_num == max_iter_num:
+            pair_t[pid] = e0
 
         T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
-
         u = wp.transpose(T) * dx
         u_norm = wp.length(u)
         eps_U = friction_epsilon * dt
@@ -2140,6 +2383,16 @@ def accumulate_contact_force_and_hessian(
     contact_body_pos: wp.array(dtype=wp.vec3),
     contact_body_vel: wp.array(dtype=wp.vec3),
     contact_normal: wp.array(dtype=wp.vec3),
+    
+    # NEW
+    ee_entry_pair_id: wp.array(dtype=wp.int32),
+    vf_entry_pair_id: wp.array(dtype=wp.int32),
+    transport_eps: float,
+    ee_pair_t: wp.array(dtype=wp.vec3),
+    vf_pair_t: wp.array(dtype=wp.vec3),
+    iter_num: int,
+    max_iter_num: int,
+
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
@@ -2149,6 +2402,10 @@ def accumulate_contact_force_and_hessian(
 
     primitive_id = t_id // NUM_THREADS_PER_COLLISION_PRIMITIVE
     t_id_current_primitive = t_id % NUM_THREADS_PER_COLLISION_PRIMITIVE
+    entry_id = collision_buffer_offset + collision_buffer_counter
+    ee_pid = -1
+    if entry_id < ee_entry_pair_id.shape[0]:
+        ee_pid = ee_entry_pair_id[entry_id]
 
     # process edge-edge collisions
     if primitive_id < collision_info.edge_colliding_edges_buffer_sizes.shape[0]:
@@ -2180,9 +2437,16 @@ def accumulate_contact_force_and_hessian(
                             friction_epsilon,
                             dt,
                             edge_edge_parallel_epsilon,
+                            
+                            #  New
+                            ee_pid,
+                            ee_pair_t,
+                            transport_eps,
+                            iter_num,
+                            max_iter_num,
                         )
                     )
-
+    
                     if has_contact:
                         # here we only handle the e1 side, because e2 will also detection this contact and add force and hessian on its own
                         if c_e1_v1 == current_color:
@@ -2202,6 +2466,10 @@ def accumulate_contact_force_and_hessian(
             tri_idx = collision_info.vertex_colliding_triangles[
                 (collision_buffer_offset + collision_buffer_counter) * 2 + 1
             ]
+            entry_id = collision_buffer_offset + collision_buffer_counter
+            vf_pid = -1
+            if entry_id < vf_entry_pair_id.shape[0]:
+                vf_pid = vf_entry_pair_id[entry_id]
 
             if particle_idx != -1 and tri_idx != -1:
                 tri_a = tri_indices[tri_idx, 0]
@@ -2241,6 +2509,7 @@ def accumulate_contact_force_and_hessian(
                         friction_mu,
                         friction_epsilon,
                         dt,
+                        vf_pid, vf_pair_t, transport_eps, iter_num, max_iter_num
                     )
 
                     if has_contact:
@@ -2341,6 +2610,37 @@ def accumulate_contact_force_and_hessian_log_collision(
     contact_normal: wp.array(dtype=wp.vec3),
 
     collision_counter: wp.array(dtype=int),
+
+    # NEW
+    ee_entry_pair_id: wp.array(dtype=wp.int32),
+    vf_entry_pair_id: wp.array(dtype=wp.int32),
+
+    transport_eps: float,
+    # # NEW: UVs + grid
+    # uvs: wp.array(dtype=wp.vec2),
+    # res_u: int,
+    # res_v: int,
+
+    # # NEW: layer ids (self-contact이면 동일)
+    # layerA: int,
+    # layerB: int,
+
+    # # NEW: pair hash table + pair state arrays
+    # hash_keys: wp.array(dtype=wp.uint64),
+    # hash_vals: wp.array(dtype=wp.int32),
+    # pair_count: wp.array(dtype=wp.int32),
+    # pair_q: wp.array(dtype=wp.vec2),
+    ee_pair_t: wp.array(dtype=wp.vec3),
+    vf_pair_t: wp.array(dtype=wp.vec3),
+    # pair_age: wp.array(dtype=wp.int32),
+    # hash_capacity: int,
+    # pair_capacity: int,
+    # max_probe: int,
+
+    # NEW: iteration info (q commit timing)
+    iter_num: int,
+    max_iter_num: int,
+
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
@@ -2381,6 +2681,11 @@ def accumulate_contact_force_and_hessian_log_collision(
     primitive_id = t_id // NUM_THREADS_PER_COLLISION_PRIMITIVE
     t_id_current_primitive = t_id % NUM_THREADS_PER_COLLISION_PRIMITIVE
 
+    entry_id = collision_buffer_offset + collision_buffer_counter
+    ee_pid = -1
+    if entry_id < ee_entry_pair_id.shape[0]:
+        ee_pid = ee_entry_pair_id[entry_id]
+
     # process edge-edge collisions
     if primitive_id < collision_info.edge_colliding_edges_buffer_sizes.shape[0]:
         e1_idx = primitive_id
@@ -2415,7 +2720,7 @@ def accumulate_contact_force_and_hessian_log_collision(
                         friction0,
                         friction1,
                         friction2,
-                        friction3
+                        friction3,
                     ) = (
                         evaluate_edge_edge_contact_2_vertices_log_collision(
                             e1_idx,
@@ -2430,6 +2735,12 @@ def accumulate_contact_force_and_hessian_log_collision(
                             friction_epsilon,
                             dt,
                             edge_edge_parallel_epsilon,
+                            #  New
+                            ee_pid,
+                            ee_pair_t,
+                            transport_eps,
+                            iter_num,
+                            max_iter_num,
                         )
                     )
 
@@ -2476,6 +2787,7 @@ def accumulate_contact_force_and_hessian_log_collision(
                         if c_e1_v2 == current_color:
                             wp.atomic_add(particle_forces, e1_v2, collision_force_1)
                             wp.atomic_add(particle_hessians, e1_v2, collision_hessian_1)
+
             collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
 
     # process vertex-triangle collisions
@@ -2487,6 +2799,10 @@ def accumulate_contact_force_and_hessian_log_collision(
             tri_idx = collision_info.vertex_colliding_triangles[
                 (collision_buffer_offset + collision_buffer_counter) * 2 + 1
             ]
+            entry_id = collision_buffer_offset + collision_buffer_counter
+            vf_pid = -1
+            if entry_id < vf_entry_pair_id.shape[0]:
+                vf_pid = vf_entry_pair_id[entry_id]
 
             if particle_idx != -1 and tri_idx != -1:
                 tri_a = tri_indices[tri_idx, 0]
@@ -2543,6 +2859,7 @@ def accumulate_contact_force_and_hessian_log_collision(
                         friction_mu,
                         friction_epsilon,
                         dt,
+                        vf_pid, vf_pair_t, transport_eps, iter_num, max_iter_num
                     )
                     
                     if has_contact:
@@ -2978,6 +3295,34 @@ def accumulate_contact_force_and_hessian_no_self_contact(
     contact_body_pos: wp.array(dtype=wp.vec3),
     contact_body_vel: wp.array(dtype=wp.vec3),
     contact_normal: wp.array(dtype=wp.vec3),
+    
+    # # NEW
+    # ee_entry_pair_id: wp.array(dtype=wp.int32),
+    # transport_eps: float,
+    # # NEW: UVs + grid
+    # uvs: wp.array(dtype=wp.vec2),
+    # res_u: int,
+    # res_v: int,
+
+    # # NEW: layer ids (self-contact이면 동일)
+    # layerA: int,
+    # layerB: int,
+
+    # # NEW: pair hash table + pair state arrays
+    # hash_keys: wp.array(dtype=wp.uint64),
+    # hash_vals: wp.array(dtype=wp.int32),
+    # pair_count: wp.array(dtype=wp.int32),
+    # pair_q: wp.array(dtype=wp.vec2),
+    # pair_t: wp.array(dtype=wp.vec3),
+    # pair_age: wp.array(dtype=wp.int32),
+    # hash_capacity: int,
+    # pair_capacity: int,
+    # max_probe: int,
+
+    # # NEW: iteration info (q commit timing)
+    # iter_num: int,
+    # max_iter_num: int,
+
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
@@ -3307,13 +3652,240 @@ pair_age를 줄이고(dead 처리) / last_seen가 갱신 안 된 pair는 age-- /
 [uv_to_cell]
 
 '''
-@wp.kernel
-def assign_pair_ids(
-    
-    ):
-    
 
-    return
+@wp.func
+def safe_normalize(v: wp.vec3, eps: float) -> wp.vec3:
+    n = wp.length(v)
+    if n > eps:
+        return v / n
+    return wp.vec3(1.0, 0.0, 0.0)
+
+@wp.func
+def tangent_transport(t_old: wp.vec3, n_new: wp.vec3, eps: float):
+    # project old tangent onto new normal plane
+    t_proj = t_old - wp.dot(t_old, n_new) * n_new
+    t_new = safe_normalize(t_proj, eps)
+
+    # if projection degenerate (t_old almost parallel to n_new), fall back
+    # by constructing any orthonormal basis from n_new
+    if wp.length(t_proj) <= eps:
+        # your existing helper
+        t_new, b_tmp = build_orthonormal_basis(n_new)
+        b_new = b_tmp
+    else:
+        b_new = wp.cross(n_new, t_new)
+        b_new = safe_normalize(b_new, eps)
+
+    return t_new, b_new
+
+@wp.kernel
+@wp.kernel
+def assign_pair_ids_vf_from_vt_list(
+    # collision info
+    collision_info_array: wp.array(dtype=TriMeshCollisionInfo),
+
+    # geometry
+    pos: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    uvs: wp.array(dtype=wp.vec2),
+
+    # params
+    layerA: int,
+    layerB: int,
+    res_u: int,
+    res_v: int,
+
+    # hash table + pair storage (VF도 EE랑 같은 pair 테이블을 써도 되고, 따로 써도 됨)
+    hash_keys: wp.array(dtype=wp.uint64),
+    hash_vals: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_t: wp.array(dtype=wp.vec3),
+    pair_age: wp.array(dtype=wp.int32),
+    hash_capacity: int,
+    pair_capacity: int,
+    max_probe: int,
+    init_age: int,
+
+    # output: per entry_id pair id
+    vf_entry_pair_id: wp.array(dtype=wp.int32),
+):
+    t_id = wp.tid()
+    collision_info = collision_info_array[0]
+
+    primitive_id = t_id // NUM_THREADS_PER_COLLISION_PRIMITIVE
+    t_id_current_primitive = t_id % NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # primitive_id corresponds to particle_idx (vertex)
+    if primitive_id >= collision_info.vertex_colliding_triangles_buffer_sizes.shape[0]:
+        return
+
+    v = primitive_id
+
+    collision_buffer_counter = t_id_current_primitive
+    collision_buffer_offset = collision_info.vertex_colliding_triangles_offsets[primitive_id]
+    buffer_size = collision_info.vertex_colliding_triangles_buffer_sizes[primitive_id]
+
+    while collision_buffer_counter < buffer_size:
+        entry_id = collision_buffer_offset + collision_buffer_counter
+
+        # bounds check for storage
+        if entry_id >= vf_entry_pair_id.shape[0]:
+            collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+            continue
+
+        tri = collision_info.vertex_colliding_triangles[entry_id * 2 + 1]
+
+        if v != -1 and tri != -1:
+            # vertex-side cell
+            uv_v = uvs[v]
+            cell_v = uv_to_cell_id(uv_v, res_u, res_v)
+
+            # triangle vertices
+            i0 = tri_indices[tri, 0]
+            i1 = tri_indices[tri, 1]
+            i2 = tri_indices[tri, 2]
+
+            a = pos[i0]
+            b = pos[i1]
+            c = pos[i2]
+            p = pos[v]
+
+            # closest point barycentric
+            closest_p, bary, _ft = triangle_closest_point(a, b, c, p)
+
+            # face-side UV at closest point
+            uv_f = uvs[i0] * bary[0] + uvs[i1] * bary[1] + uvs[i2] * bary[2]
+            cell_f = uv_to_cell_id(uv_f, res_u, res_v)
+
+            la, ca, lb, cb = canonicalize_pair(layerA, cell_v, layerB, cell_f)
+
+            # type_id = 1 for VF
+            key = pack_pair_key(1, la, ca, lb, cb)
+
+            init_t = wp.vec3(1.0, 0.0, 0.0)
+
+            pid = hashmap_find_or_insert_pair_id(
+                key,
+                hash_keys, hash_vals, pair_count,
+                pair_t, pair_age,
+                hash_capacity, pair_capacity,
+                init_t, init_age,
+                max_probe
+            )
+
+            vf_entry_pair_id[entry_id] = pid
+            if pid >= 0:
+                pair_age[pid] = init_age
+        else:
+            vf_entry_pair_id[entry_id] = -1
+
+        collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+# NUM_THREADS_PER_COLLISION_PRIMITIVE 는 너 코드에 이미 정의돼 있다고 가정
+
+@wp.kernel
+def assign_pair_ids_ee_from_collision_info(
+    # collision info
+    collision_info_array: wp.array(dtype=TriMeshCollisionInfo),
+
+    # geometry
+    pos: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    uvs: wp.array(dtype=wp.vec2),
+
+    # params
+    layerA: int,
+    layerB: int,
+    res_u: int,
+    res_v: int,
+    edge_edge_parallel_epsilon: float,
+
+    # hash table + pair storage
+    hash_keys: wp.array(dtype=wp.uint64),
+    hash_vals: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_t: wp.array(dtype=wp.vec3),
+    pair_age: wp.array(dtype=wp.int32),
+    hash_capacity: int,
+    pair_capacity: int,
+    max_probe: int,
+    init_age: int,
+
+    # output: per "entry" pair id (entry index = collision_buffer_offset + collision_buffer_counter)
+    ee_entry_pair_id: wp.array(dtype=wp.int32),
+):
+    t_id = wp.tid()
+    collision_info = collision_info_array[0]
+
+    primitive_id = t_id // NUM_THREADS_PER_COLLISION_PRIMITIVE
+    t_id_current_primitive = t_id % NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # Each primitive_id corresponds to an "e1_idx" in your accumulate kernel
+    if primitive_id >= collision_info.edge_colliding_edges_buffer_sizes.shape[0]:
+        return
+
+    e1_idx = primitive_id
+
+    collision_buffer_counter = t_id_current_primitive
+    collision_buffer_offset = collision_info.edge_colliding_edges_offsets[primitive_id]
+    buffer_size = collision_info.edge_colliding_edges_buffer_sizes[primitive_id]
+
+    while collision_buffer_counter < buffer_size:
+        entry_id = collision_buffer_offset + collision_buffer_counter
+        if entry_id >= ee_entry_pair_id.shape[0]:
+            collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+            continue
+        # edge_colliding_edges stores pairs (e1, e2) but you only read the 2nd int in your code:
+        # [2*entry + 0] = e1 (often redundant), [2*entry + 1] = e2
+        e2_idx = collision_info.edge_colliding_edges[2 * entry_id + 1]
+
+        if e1_idx != -1 and e2_idx != -1:
+            # endpoints
+            e1_v1 = edge_indices[e1_idx, 2]
+            e1_v2 = edge_indices[e1_idx, 3]
+            e2_v1 = edge_indices[e2_idx, 2]
+            e2_v2 = edge_indices[e2_idx, 3]
+
+            p1 = pos[e1_v1]
+            q1 = pos[e1_v2]
+            p2 = pos[e2_v1]
+            q2 = pos[e2_v2]
+
+            # closest params s,t (recomputed, same as evaluate)
+            st = wp.closest_point_edge_edge(p1, q1, p2, q2, edge_edge_parallel_epsilon)
+            s = st[0]
+            t = st[1]
+
+            # uv along edges
+            uv1 = lerp_uv(uvs[e1_v1], uvs[e1_v2], s)
+            uv2 = lerp_uv(uvs[e2_v1], uvs[e2_v2], t)
+
+            cell1 = uv_to_cell_id(uv1, res_u, res_v)
+            cell2 = uv_to_cell_id(uv2, res_u, res_v)
+
+            la, ca, lb, cb = canonicalize_pair(layerA, cell1, layerB, cell2)
+
+            # type_id=0 for EE
+            key = pack_pair_key(0, la, ca, lb, cb)
+
+            init_t = wp.vec3(1.0, 0.0, 0.0)
+
+            pid = hashmap_find_or_insert_pair_id(
+                key,
+                hash_keys, hash_vals, pair_count,
+                pair_t, pair_age,
+                hash_capacity, pair_capacity,
+                init_t, init_age,
+                max_probe
+            )
+
+            ee_entry_pair_id[entry_id] = pid
+            if pid >= 0:
+                pair_age[pid] = init_age
+        else:
+            ee_entry_pair_id[entry_id] = -1
+
+        collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
 
 @wp.kernel
 def decay_pairs(

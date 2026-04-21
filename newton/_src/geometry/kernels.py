@@ -2511,7 +2511,7 @@ def edge_offset_block(
         # adj_v_index = tri_indices[adj_face, adj_v_order]
         e_v0_id = edge_indices[edge_id, e_order]
 
-        # `util.py` MeshAdjacency and `particle_vbd_kernels_edit.py` fill_adjacent_edges()
+        # `util.py` MeshAdjacency and `particle_vbd_kernels.py` fill_adjacent_edges()
         if e_order == 2:
             if e_v0_id != e1_index or edge_indices[edge_id, 3] != e2_index:
                 continue # if not e1 e2 edge, skip

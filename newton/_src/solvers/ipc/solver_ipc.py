@@ -30,7 +30,7 @@ from ipc_kernels import (
     project_Hessian_to_SPD,
     trimesh_with_self_contact
 )
-from ..vbd.particle_vbd_kernels_edit import (
+from ..vbd.particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     ParticleForceElementAdjacencyInfo,

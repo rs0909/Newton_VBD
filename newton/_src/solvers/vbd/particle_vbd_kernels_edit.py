@@ -19,7 +19,7 @@ This module is intended to host the particle/soft-body specific parts of the
 VBD solver (cloth, springs, triangles, tets, particle contacts, etc.).
 
 The high-level :class:`SolverVBD` interface should remain in
-``solver_vbd_edit.py`` and call into functions defined here.
+``solver_vbd.py`` and call into functions defined here.
 """
 
 from __future__ import annotations
