@@ -1889,6 +1889,7 @@ def solve_trimesh_no_self_contact_tile(
     particle_hessians: wp.array(dtype=wp.mat33),
     # JGS2 cubature weights
     cubature_face_weights: wp.array(dtype=float),
+    use_coord_condensation: int,
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -2000,22 +2001,28 @@ def solve_trimesh_no_self_contact_tile(
     hj_total  = wp.tile_reduce(wp.add, hj_tile)[0]
 
     if thread_idx == 0:
-        h_total = (
+        h_base = (
             h_total
             + mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
             + particle_hessians[particle_index]
-            + hj_total   # JGS2 Hessian correction
         )
-        if abs(wp.determinant(h_total)) > 1e-5:
-            h_inv = wp.inverse(h_total)
-            f_total = (
-                f_total
-                + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
-                + particle_forces[particle_index]
-                + fj_total   # JGS2 gradient correction
-            )
+        f_final = (
+            f_total
+            + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
+            + particle_forces[particle_index]
+            + fj_total   # gradient correction same for JGS2 and CoC
+        )
+        # JGS2 / CoC: branch on Hessian augmentation vs deflation
+        h_final = h_base + hj_total  # default: JGS2
+        if use_coord_condensation == 1:
+            h_coc = h_base - hj_total
+            if abs(wp.determinant(h_coc)) > 1e-5:
+                h_final = h_coc
+            # else: keep JGS2 fallback
 
-            pos_new[particle_index] = particle_pos + h_inv * f_total
+        if abs(wp.determinant(h_final)) > 1e-5:
+            h_inv = wp.inverse(h_final)
+            pos_new[particle_index] = particle_pos + h_inv * f_final
 
 
 @wp.kernel
@@ -2042,6 +2049,8 @@ def solve_trimesh_no_self_contact(
     particle_hessians: wp.array(dtype=wp.mat33),
     # JGS2 cubature weights (one float per vertex-adjacent-face entry)
     cubature_face_weights: wp.array(dtype=float),
+    # 0 = JGS2 (augment Hessian), 1 = Coordinate Condensation (deflate Hessian)
+    use_coord_condensation: int,
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -2144,13 +2153,19 @@ def solve_trimesh_no_self_contact(
     h += particle_hessians[particle_index]
     f += particle_forces[particle_index]
 
-    # JGS2: add reduced Hessian H̃ and gradient correction f̃ (Eq. 15)
-    h += h_jgs2
-    f += f_jgs2
+    # JGS2 / CoC: apply reduced Hessian H̃ and gradient correction f̃
+    f_final = f + f_jgs2
+    h_final = h + h_jgs2  # default: JGS2 (augment Hessian)
+    if use_coord_condensation == 1:
+        # CoC: deflate Hessian toward Newton Schur complement (H_ii - S, S ≈ H̃)
+        h_coc = h - h_jgs2
+        if abs(wp.determinant(h_coc)) > 1e-5:
+            h_final = h_coc
+        # else: h_final already set to JGS2 fallback above
 
-    if abs(wp.determinant(h)) > 1e-5:
-        hInv = wp.inverse(h)
-        pos_new[particle_index] = particle_pos + hInv * f
+    if abs(wp.determinant(h_final)) > 1e-5:
+        hInv = wp.inverse(h_final)
+        pos_new[particle_index] = particle_pos + hInv * f_final
 
 
 @wp.kernel

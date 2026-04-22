@@ -171,6 +171,7 @@ class SolverVBD(SolverBase):
         rigid_dahl_tau: float | wp.array = 1.0,  # Dahl: memory decay length
 
         ogc_contact: bool = False,
+        coordinate_condensation: bool = False,
     ):
         """
         Args:
@@ -252,6 +253,7 @@ class SolverVBD(SolverBase):
         super().__init__(model)
         
         self.ogc_contact = ogc_contact
+        self.use_coord_condensation = 1 if coordinate_condensation else 0
         if self.ogc_contact:
             print()
             print(">>> OGC Contact mode ON <<<")
@@ -1555,6 +1557,7 @@ class SolverVBD(SolverBase):
                             self.particle_forces,
                             self.particle_hessians,
                             self.cubature_face_weights,
+                            self.use_coord_condensation,
                         ],
                         outputs=[
                             state_out.particle_q,
@@ -1588,6 +1591,7 @@ class SolverVBD(SolverBase):
                             self.particle_forces,
                             self.particle_hessians,
                             self.cubature_face_weights,
+                            self.use_coord_condensation,
                         ],
                         outputs=[
                             state_out.particle_q,
