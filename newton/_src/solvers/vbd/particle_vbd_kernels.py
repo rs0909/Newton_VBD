@@ -55,6 +55,69 @@ TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE = 16
 class mat32(matrix(shape=(3, 2), dtype=float32)):
     pass
 
+def compute_stvk_hessian_blocks_rest(tri_id, pos_rest, tri_indices, tri_poses, tri_areas, tri_materials):
+    """
+    삼각형 하나에서 모든 vertex 쌍의 Hessian 블록 계산
+    반환: H[i][j] = K_ij (3×3) for i,j in {0,1,2}
+    """
+    v0, v1, v2 = tri_indices[tri_id]
+    x0 = pos_rest[v0]
+    x01 = pos_rest[v1] - x0
+    x02 = pos_rest[v2] - x0
+
+    DmInv = tri_poses[tri_id]  # 2×2
+    DmInv00, DmInv01 = DmInv[0, 0], DmInv[0, 1]
+    DmInv10, DmInv11 = DmInv[1, 0], DmInv[1, 1]
+
+    mu = tri_materials[tri_id, 0]
+    lmbd = tri_materials[tri_id, 1]
+    area = tri_areas[tri_id]
+
+    # Deformation gradient (rest-shape에서는 F = I에 가까움)
+    f0 = x01 * DmInv00 + x02 * DmInv10
+    f1 = x01 * DmInv01 + x02 * DmInv11
+
+    f0_dot_f0 = np.dot(f0, f0)
+    f1_dot_f1 = np.dot(f1, f1)
+    f0_dot_f1 = np.dot(f0, f1)
+
+    I3 = np.eye(3)
+    f0_outer_f0 = np.outer(f0, f0)
+    f1_outer_f1 = np.outer(f1, f1)
+    f0_outer_f1 = np.outer(f0, f1)
+    f1_outer_f0 = np.outer(f1, f0)
+
+    Ic = f0_dot_f0 + f1_dot_f1
+    two_dpsi_dIc = -mu + (0.5 * Ic - 1.0) * lmbd
+
+    # 삼각형 공통 항 (d2E/dF2)
+    A00 = lmbd * f0_outer_f0 + two_dpsi_dIc * I3 + mu * (f0_dot_f0 * I3 + 2.0 * f0_outer_f0 + f1_outer_f1)
+    A11 = lmbd * f1_outer_f1 + two_dpsi_dIc * I3 + mu * (f1_dot_f1 * I3 + 2.0 * f1_outer_f1 + f0_outer_f0)
+    A01 = lmbd * f0_outer_f1 + mu * (f0_dot_f1 * I3 + f1_outer_f0)
+    A01_sym = A01 + A01.T
+
+    # 각 vertex의 df0_dx, df1_dx 스칼라
+    # v_order: 0=v0, 1=v1, 2=v2
+    df0 = np.array([
+        DmInv00 * (-1) + DmInv10 * (-1),  # v0: mask1-mask0=-1, mask2-mask0=-1
+        DmInv00 * ( 1) + DmInv10 * ( 0),  # v1: mask1-mask0=+1, mask2-mask0= 0
+        DmInv00 * ( 0) + DmInv10 * ( 1),  # v2: mask1-mask0= 0, mask2-mask0=+1
+    ])
+    df1 = np.array([
+        DmInv01 * (-1) + DmInv11 * (-1),
+        DmInv01 * ( 1) + DmInv11 * ( 0),
+        DmInv01 * ( 0) + DmInv11 * ( 1),
+    ])
+
+    # 모든 vertex 쌍의 K_ij 계산
+    H = np.zeros((3, 3, 3, 3))  # H[i][j] = 3×3 행렬
+    for i in range(3):
+        for j in range(3):
+            H[i, j] = (df0[i]*df0[j] * A00
+                     + df1[i]*df1[j] * A11
+                     + df0[i]*df1[j] * A01
+                     + df1[i]*df0[j] * A01.T) * area
+    return H, [v0, v1, v2]
 
 @wp.struct
 class ParticleForceElementAdjacencyInfo:
@@ -1824,6 +1887,8 @@ def solve_trimesh_no_self_contact_tile(
     # contact info
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
+    # JGS2 cubature weights
+    cubature_face_weights: wp.array(dtype=float),
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -1848,8 +1913,12 @@ def solve_trimesh_no_self_contact_tile(
 
     f = wp.vec3(0.0)
     h = wp.mat33(0.0)
+    # JGS2 per-thread accumulators
+    h_jgs2 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    f_jgs2 = wp.vec3(0.0, 0.0, 0.0)
 
     num_adj_faces = get_vertex_num_adjacent_faces(adjacency, particle_index)
+    adj_face_weight_base = adjacency.v_adj_faces_offsets[particle_index] >> 1
 
     batch_counter = wp.int32(0)
 
@@ -1873,11 +1942,15 @@ def solve_trimesh_no_self_contact_tile(
             tri_materials[tri_index, 2],
             dt,
         )
-        # compute damping
         stvk_forces[particle_index] += f_tri
 
         f += f_tri
         h += h_tri
+
+        # JGS2 cubature correction
+        w = cubature_face_weights[adj_face_weight_base + adj_tri_counter]
+        h_jgs2 = h_jgs2 + w * h_tri
+        f_jgs2 = f_jgs2 + w * f_tri
 
         # fmt: off
         if wp.static("elasticity_force_hessian" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -1890,7 +1963,6 @@ def solve_trimesh_no_self_contact_tile(
             )
             # fmt: on
 
-    #
     batch_counter = wp.int32(0)
     num_adj_edges = get_vertex_num_adjacent_edges(adjacency, particle_index)
     while batch_counter + thread_idx < num_adj_edges:
@@ -1917,17 +1989,22 @@ def solve_trimesh_no_self_contact_tile(
             f += f_edge
             h += h_edge
 
-    f_tile = wp.tile(f, preserve_type=True)
-    h_tile = wp.tile(h, preserve_type=True)
+    f_tile    = wp.tile(f,     preserve_type=True)
+    h_tile    = wp.tile(h,     preserve_type=True)
+    fj_tile   = wp.tile(f_jgs2, preserve_type=True)
+    hj_tile   = wp.tile(h_jgs2, preserve_type=True)
 
-    f_total = wp.tile_reduce(wp.add, f_tile)[0]
-    h_total = wp.tile_reduce(wp.add, h_tile)[0]
+    f_total   = wp.tile_reduce(wp.add, f_tile)[0]
+    h_total   = wp.tile_reduce(wp.add, h_tile)[0]
+    fj_total  = wp.tile_reduce(wp.add, fj_tile)[0]
+    hj_total  = wp.tile_reduce(wp.add, hj_tile)[0]
 
     if thread_idx == 0:
         h_total = (
             h_total
             + mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
             + particle_hessians[particle_index]
+            + hj_total   # JGS2 Hessian correction
         )
         if abs(wp.determinant(h_total)) > 1e-5:
             h_inv = wp.inverse(h_total)
@@ -1935,6 +2012,7 @@ def solve_trimesh_no_self_contact_tile(
                 f_total
                 + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
                 + particle_forces[particle_index]
+                + fj_total   # JGS2 gradient correction
             )
 
             pos_new[particle_index] = particle_pos + h_inv * f_total
@@ -1962,6 +2040,8 @@ def solve_trimesh_no_self_contact(
     # contact info
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
+    # JGS2 cubature weights (one float per vertex-adjacent-face entry)
+    cubature_face_weights: wp.array(dtype=float),
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -1982,7 +2062,12 @@ def solve_trimesh_no_self_contact(
     f = mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
     h = mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
 
+    # JGS2 reduced Hessian / force accumulators (Lan et al. 2025, Eq. 15)
+    h_jgs2 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    f_jgs2 = wp.vec3(0.0, 0.0, 0.0)
+
     # elastic force and hessian
+    adj_face_weight_base = adjacency.v_adj_faces_offsets[particle_index] >> 1
     for i_adj_tri in range(get_vertex_num_adjacent_faces(adjacency, particle_index)):
         tri_id, particle_order = get_vertex_adjacent_face_id_order(adjacency, particle_index, i_adj_tri)
 
@@ -2020,6 +2105,11 @@ def solve_trimesh_no_self_contact(
         f = f + f_tri
         h = h + h_tri
 
+        # JGS2: accumulate cubature-weighted correction
+        w = cubature_face_weights[adj_face_weight_base + i_adj_tri]
+        h_jgs2 = h_jgs2 + w * h_tri
+        f_jgs2 = f_jgs2 + w * f_tri
+
         # fmt: off
         if wp.static("elasticity_force_hessian" in VBD_DEBUG_PRINTING_OPTIONS):
             wp.printf(
@@ -2053,6 +2143,10 @@ def solve_trimesh_no_self_contact(
 
     h += particle_hessians[particle_index]
     f += particle_forces[particle_index]
+
+    # JGS2: add reduced Hessian H̃ and gradient correction f̃ (Eq. 15)
+    h += h_jgs2
+    f += f_jgs2
 
     if abs(wp.determinant(h)) > 1e-5:
         hInv = wp.inverse(h)
@@ -3287,3 +3381,296 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             pos_new[particle_index] = apply_conservative_bound_truncation(
                 particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
             )
+
+# ===== JGS2 Precomputation =====
+def compute_schur_static_numpy(
+    particle_count,
+    pos_rest,       # (N, 3) numpy
+    tri_indices,    # (T, 3) numpy
+    tri_poses,      # (T, 2, 2) numpy
+    tri_areas,      # (T,) numpy
+    tri_materials,  # (T, 3) numpy  [mu, lambda, damping]
+):
+    """
+    Rest-shape에서 static Schur complement 계산.
+    S_i = K_ii - sum_{j in N(i)} K_ij @ inv(K_jj) @ K_ji
+    """
+    N = particle_count
+    T = len(tri_indices)
+
+    def get_hessian_blocks(tri_id):
+        """삼각형 하나에서 3×3 vertex 쌍의 K_ij 블록 반환 (3,3,3,3)"""
+        v0, v1, v2 = tri_indices[tri_id]
+        x0 = pos_rest[v0]
+        x01 = pos_rest[v1] - x0
+        x02 = pos_rest[v2] - x0
+
+        DmInv = tri_poses[tri_id]  # 2×2
+        D00, D01 = DmInv[0, 0], DmInv[0, 1]
+        D10, D11 = DmInv[1, 0], DmInv[1, 1]
+
+        mu   = tri_materials[tri_id, 0]
+        lmbd = tri_materials[tri_id, 1]
+        area = tri_areas[tri_id]
+
+        # Deformation gradient columns
+        f0 = x01 * D00 + x02 * D10
+        f1 = x01 * D01 + x02 * D11
+
+        f00 = np.dot(f0, f0)
+        f11 = np.dot(f1, f1)
+        f01 = np.dot(f0, f1)
+
+        I3 = np.eye(3)
+        Ic = f00 + f11
+        two_dpsi_dIc = -mu + (0.5 * Ic - 1.0) * lmbd
+
+        # 삼각형 공통 항
+        A00 = (lmbd * np.outer(f0, f0)
+               + two_dpsi_dIc * I3
+               + mu * (f00 * I3 + 2.0 * np.outer(f0, f0) + np.outer(f1, f1)))
+        A11 = (lmbd * np.outer(f1, f1)
+               + two_dpsi_dIc * I3
+               + mu * (f11 * I3 + 2.0 * np.outer(f1, f1) + np.outer(f0, f0)))
+        A01 = lmbd * np.outer(f0, f1) + mu * (f01 * I3 + np.outer(f1, f0))
+        A01T = A01.T
+
+        # 각 vertex의 df0, df1 스칼라
+        # v_order 0: mask = (-1, -1), 1: (1, 0), 2: (0, 1)
+        masks = [(-1, -1), (1, 0), (0, 1)]
+        df0 = [D00 * m[0] + D10 * m[1] for m in masks]
+        df1 = [D01 * m[0] + D11 * m[1] for m in masks]
+
+        # K_ij for all (i,j) pairs
+        H = np.zeros((3, 3, 3, 3))
+        for i in range(3):
+            for j in range(3):
+                H[i, j] = (df0[i]*df0[j] * A00
+                          + df1[i]*df1[j] * A11
+                          + df0[i]*df1[j] * A01
+                          + df1[i]*df0[j] * A01T) * area
+        return H, (v0, v1, v2)
+
+    # Step 1: K_ii (diagonal blocks) 계산
+    K_diag = np.zeros((N, 3, 3))
+    for tri_id in range(T):
+        H, (v0, v1, v2) = get_hessian_blocks(tri_id)
+        verts = [v0, v1, v2]
+        for i_local in range(3):
+            K_diag[verts[i_local]] += H[i_local, i_local]
+
+    # DEBUG
+    # get_hessian_blocks 검증
+    # 단순 체크: H[i,i] diagonal이 양수인지
+    for tri_id in range(min(5, T)):
+        H, (v0, v1, v2) = get_hessian_blocks(tri_id)
+        print(f"tri {tri_id}:")
+        for i in range(3):
+            print(f"  K_{i}{i} diag: {np.diag(H[i,i])}")
+        for i in range(3):
+            for j in range(3):
+                if i != j:
+                    print(f"  K_{i}{j} norm: {np.linalg.norm(H[i,j]):.4f}")
+    # correction 크기 vs K_ii 크기 비교
+    print(f"K_ii mean norm: {np.mean([np.linalg.norm(K_diag[i]) for i in range(100)]):.4f}")
+                
+    # Step 2: Schur complement 계산
+    # S_i = K_ii - sum_j K_ij @ inv(K_jj) @ K_ji
+    schur = np.zeros((N, 3, 3))
+    for tri_id in range(T):
+        H, (v0, v1, v2) = get_hessian_blocks(tri_id)
+        verts = [v0, v1, v2]
+        for i_local in range(3):
+            i_g = verts[i_local]
+            for j_local in range(3):
+                if i_local == j_local:
+                    continue
+                j_g = verts[j_local]
+                K_ij = H[i_local, j_local]  # 3×3
+                K_jj = K_diag[j_g]          # 3×3
+                if abs(np.linalg.det(K_jj)) > 1e-10:
+                    K_jj_inv = np.linalg.inv(K_jj)
+                    schur[i_g] -= K_ij @ K_jj_inv @ K_ij.T
+    
+    # clamping 전 값 출력 추가
+    print(f"[JGS2] before clamping mean diag: {np.mean(schur[:, [0,1,2], [0,1,2]]):.4f}")
+    print(f"[JGS2] before clamping min eigval: {min(np.linalg.eigvalsh(schur[i]).min() for i in range(min(N,100))):.4f}")
+    
+    # Step 3: PSD clamping (음수 고유값 제거)
+    for i in range(N):
+        eigvals, eigvecs = np.linalg.eigh(schur[i])
+        eigvals = np.maximum(eigvals, 0.0)
+        schur[i] = eigvecs @ np.diag(eigvals) @ eigvecs.T
+    
+    print(f"[JGS2] schur correction mean diag: {np.mean(schur[:, [0,1,2], [0,1,2]]):.4f}")
+    print(f"[JGS2] any nan? {np.any(np.isnan(schur))}")
+
+    return schur.astype(np.float32)
+
+
+def _nnls_numpy(A, b, max_iter=2000, tol=1e-12):
+    """Non-negative least squares via projected gradient descent.
+
+    Solves  min_{w>=0} ||A w - b||^2  for small dense A (m x n, n ~ 6).
+    """
+    AtA = A.T @ A
+    Atb = A.T @ b
+    lip = np.linalg.norm(AtA, ord=2) + 1e-10   # Lipschitz constant
+    step = 1.0 / lip
+    w = np.maximum(np.linalg.lstsq(A, b, rcond=None)[0], 0.0)
+    for _ in range(max_iter):
+        grad = AtA @ w - Atb
+        w_new = np.maximum(w - step * grad, 0.0)
+        if np.linalg.norm(w_new - w) < tol:
+            return w_new
+        w = w_new
+    return w
+
+
+def compute_jgs2_precomputation_numpy(
+    particle_count,
+    pos_rest,            # (N, 3) numpy
+    tri_indices,         # (T, 3) numpy
+    tri_poses,           # (T, 2, 2) numpy
+    tri_areas,           # (T,) numpy
+    tri_materials,       # (T, 2+) numpy  [mu, lambda, ...]
+    v_adj_faces,         # (M,) numpy int32 – flat (tri_id, v_order) pairs
+    v_adj_faces_offsets, # (N+1,) numpy int32 – byte offsets into v_adj_faces
+):
+    """JGS2 pre-computation (Section 4-6 of Lan et al. 2025).
+
+    Computes per-(vertex, adjacent-triangle) cubature weights w_e such that at
+    runtime:
+
+        H_tilde^k_i ≈ Σ_e  w_e · H^{e,k}_{i,i}
+        f_tilde^k_i ≈ Σ_e  w_e · f^{e,k}_i
+
+    The weights are trained on the rest-shape correction
+
+        H̄_tilde_i = Σ_{j∈N(i)} K_ij · K_jj^{-1} · K_ij^T   (≥ 0, PSD)
+
+    via non-negative least squares (NNLS) so that
+
+        Σ_e  w_e · K^e_{i,i}  ≈  H̄_tilde_i
+
+    Using current-configuration per-element Hessians at runtime implicitly
+    captures co-rotation without an explicit polar-decomposition pass.
+
+    Returns
+    -------
+    cubature_face_weights : float32 ndarray, shape (len(v_adj_faces)//2,)
+        Flat array indexed as  v_adj_faces_offsets[i]//2 + j  for vertex i,
+        j-th adjacent face.
+    """
+    N = particle_count
+    T = len(tri_indices)
+
+    # ------------------------------------------------------------------ #
+    # Helper: rest-shape Hessian blocks for one triangle                   #
+    # Returns H[3,3,3,3] where H[a,b] = K^e_{ab} (3×3 block)              #
+    # ------------------------------------------------------------------ #
+    def _hessian_blocks(tri_id):
+        v0, v1, v2 = tri_indices[tri_id]
+        x0 = pos_rest[v0]
+        D = tri_poses[tri_id]        # 2×2
+        D00, D01 = D[0, 0], D[0, 1]
+        D10, D11 = D[1, 0], D[1, 1]
+        mu   = tri_materials[tri_id, 0]
+        lmbd = tri_materials[tri_id, 1]
+        area = tri_areas[tri_id]
+
+        f0 = (pos_rest[v1] - x0) * D00 + (pos_rest[v2] - x0) * D10
+        f1 = (pos_rest[v1] - x0) * D01 + (pos_rest[v2] - x0) * D11
+
+        f00 = np.dot(f0, f0)
+        f11 = np.dot(f1, f1)
+        f01 = np.dot(f0, f1)
+        I3  = np.eye(3)
+        Ic  = f00 + f11
+        c   = -mu + (0.5 * Ic - 1.0) * lmbd
+
+        A00 = lmbd * np.outer(f0, f0) + c * I3 + mu * (f00 * I3 + 2.0 * np.outer(f0, f0) + np.outer(f1, f1))
+        A11 = lmbd * np.outer(f1, f1) + c * I3 + mu * (f11 * I3 + 2.0 * np.outer(f1, f1) + np.outer(f0, f0))
+        A01 = lmbd * np.outer(f0, f1) + mu * (f01 * I3 + np.outer(f1, f0))
+
+        df0 = np.array([D00*(-1)+D10*(-1), D00*1+D10*0, D00*0+D10*1])
+        df1 = np.array([D01*(-1)+D11*(-1), D01*1+D11*0, D01*0+D11*1])
+
+        H = np.zeros((3, 3, 3, 3))
+        for a in range(3):
+            for b in range(3):
+                H[a, b] = (df0[a]*df0[b]*A00 + df1[a]*df1[b]*A11
+                           + df0[a]*df1[b]*A01 + df1[a]*df0[b]*A01.T) * area
+        return H, (v0, v1, v2)
+
+    # ------------------------------------------------------------------ #
+    # Step 1: K_diag[i] = Σ_{e∋i} K^e_{ii}  (3×3 per vertex)             #
+    # ------------------------------------------------------------------ #
+    K_diag = np.zeros((N, 3, 3))
+    # Also store per-triangle diagonal blocks for later NNLS use
+    tri_diag = {}   # tri_id -> list[(v_global, local_idx, K^e_{ii})]
+    for tri_id in range(T):
+        H, verts = _hessian_blocks(tri_id)
+        tri_diag[tri_id] = []
+        for loc, vg in enumerate(verts):
+            K_diag[vg] += H[loc, loc]
+            tri_diag[tri_id].append((vg, loc, H[loc, loc].copy()))
+
+    # ------------------------------------------------------------------ #
+    # Step 2: H̄_tilde[i] = Σ_{j∈N(i)} K_ij · K_jj^{-1} · K_ij^T (≥ 0) #
+    # ------------------------------------------------------------------ #
+    H_tilde_bar = np.zeros((N, 3, 3))
+    for tri_id in range(T):
+        H, (v0, v1, v2) = _hessian_blocks(tri_id)
+        verts = [v0, v1, v2]
+        for a in range(3):
+            i_g = verts[a]
+            for b in range(3):
+                if a == b:
+                    continue
+                j_g = verts[b]
+                K_ij = H[a, b]
+                K_jj = K_diag[j_g]
+                # Use pseudo-inverse: handles singular Hessian (e.g. z-direction in flat cloth)
+                K_jj_pinv = np.linalg.pinv(K_jj, rcond=1e-6)
+                H_tilde_bar[i_g] += K_ij @ K_jj_pinv @ K_ij.T   # + sign (JGS2 Eq. 15)
+
+    # ------------------------------------------------------------------ #
+    # Step 3: NNLS cubature – find w_e ≥ 0 per (vertex, adj-tri) such    #
+    # that  Σ_e w_e · K^e_{i,i} ≈ H̄_tilde[i]                           #
+    # ------------------------------------------------------------------ #
+    total_adj_face_entries = len(v_adj_faces) // 2  # one float per (vertex, adj-face) pair
+    cubature_weights = np.zeros(total_adj_face_entries, dtype=np.float32)
+
+    for i in range(N):
+        off   = int(v_adj_faces_offsets[i])
+        off1  = int(v_adj_faces_offsets[i + 1])
+        n_adj = (off1 - off) >> 1
+        if n_adj == 0:
+            continue
+
+        target = H_tilde_bar[i]         # 3×3
+        target_norm = np.linalg.norm(target)
+        if target_norm < 1e-12:
+            continue
+
+        # Build design matrix A ∈ R^{9 × n_adj}
+        A_cols = []
+        for j in range(n_adj):
+            tri_id  = int(v_adj_faces[off + 2 * j])
+            v_order = int(v_adj_faces[off + 2 * j + 1])
+            H, _ = _hessian_blocks(tri_id)
+            A_cols.append(H[v_order, v_order].flatten())  # K^e_{i,i} flattened
+
+        A = np.column_stack(A_cols)   # (9, n_adj)
+        b = target.flatten()          # (9,)
+
+        w = _nnls_numpy(A, b)
+
+        weight_off = off >> 1         # v_adj_faces_offsets[i] // 2
+        cubature_weights[weight_off : weight_off + n_adj] = w.astype(np.float32)
+
+    nnz = np.count_nonzero(cubature_weights)
+    print(f"[JGS2] cubature weights: nnz={nnz}/{total_adj_face_entries}, "
+          f"max={cubature_weights.max():.4f}, mean_pos={cubature_weights[cubature_weights>0].mean() if nnz else 0:.4f}")
+    return cubature_weights

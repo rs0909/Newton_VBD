@@ -75,7 +75,7 @@ class Example:
 
         # common cloth properties
         common_params = {
-            "pos": wp.vec3(0.0, 0.0, 4.0),
+            "pos": wp.vec3(0.0, 0.0, 10.0),
             "rot": wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), wp.pi * 0.5),
             "vel": wp.vec3(0.0, 0.0, 0.0),
             "dim_x": self.sim_width,
@@ -145,7 +145,8 @@ class Example:
                 iterations=self.iterations,
             )
         else:  # self.solver_type == "vbd"
-            self.solver = newton.solvers.SolverVBD(model=self.model, iterations=self.iterations)
+            self.solver = newton.solvers.SolverVBD(model=self.model, iterations=self.iterations, 
+                                                   particle_enable_self_contact=False)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

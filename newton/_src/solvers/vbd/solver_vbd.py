@@ -31,6 +31,7 @@ from .particle_vbd_kernels import (
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     ParticleForceElementAdjacencyInfo,
     # Topological filtering helper functions
+    compute_jgs2_precomputation_numpy,
     _set_to_csr,
     accumulate_contact_force_and_hessian,
     accumulate_contact_force_and_hessian_log_collision,
@@ -405,6 +406,25 @@ class SolverVBD(SolverBase):
         self.particle_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.stvk_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.particle_hessians = wp.zeros(self.model.particle_count, dtype=wp.mat33, device=self.device)
+        
+        # JGS2 pre-computation: cubature weights  (Lan et al. 2025)
+        if model.tri_count > 0 and self.particle_adjacency.v_adj_faces.size > 0:
+            v_adj_faces_cpu    = self.particle_adjacency.v_adj_faces.to("cpu").numpy()
+            v_adj_offsets_cpu  = self.particle_adjacency.v_adj_faces_offsets.to("cpu").numpy()
+            cubature_np = compute_jgs2_precomputation_numpy(
+                particle_count       = model.particle_count,
+                pos_rest             = model.particle_q.numpy(),
+                tri_indices          = model.tri_indices.numpy().reshape(-1, 3),
+                tri_poses            = model.tri_poses.numpy(),
+                tri_areas            = model.tri_areas.numpy(),
+                tri_materials        = model.tri_materials.numpy(),
+                v_adj_faces          = v_adj_faces_cpu,
+                v_adj_faces_offsets  = v_adj_offsets_cpu,
+            )
+        else:
+            cubature_np = np.zeros(0, dtype=np.float32)
+        self.cubature_face_weights = wp.from_numpy(cubature_np, dtype=float, device=self.device)
+        print(f"[JGS2] cubature_face_weights precomputed: {cubature_np.shape[0]} entries")
 
         if data_collector.is_log_collision():
             vt_contact_max = self.model.particle_count * particle_vertex_contact_buffer_size
@@ -1534,6 +1554,7 @@ class SolverVBD(SolverBase):
                             self.particle_adjacency,
                             self.particle_forces,
                             self.particle_hessians,
+                            self.cubature_face_weights,
                         ],
                         outputs=[
                             state_out.particle_q,
@@ -1566,6 +1587,7 @@ class SolverVBD(SolverBase):
                             self.particle_adjacency,
                             self.particle_forces,
                             self.particle_hessians,
+                            self.cubature_face_weights,
                         ],
                         outputs=[
                             state_out.particle_q,
