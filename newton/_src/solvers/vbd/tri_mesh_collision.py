@@ -53,6 +53,14 @@ class TriMeshCollisionInfo:
     edge_colliding_edges_count: wp.array(dtype=wp.int32)
     edge_colliding_edges_min_dist: wp.array(dtype=float)
 
+    # Augmented Lagrangian contact state per contact slot
+    # VT slots indexed by: vertex_colliding_triangles_offsets[v] + i_collision
+    # EE slots indexed by: edge_colliding_edges_offsets[e] + i_collision
+    vt_al_lambda: wp.array(dtype=float)
+    vt_al_gamma: wp.array(dtype=float)
+    ee_al_lambda: wp.array(dtype=float)
+    ee_al_gamma: wp.array(dtype=float)
+
 
 @wp.func
 def get_vertex_colliding_triangles_count(col_info: TriMeshCollisionInfo, v: int):
@@ -238,6 +246,15 @@ class TriMeshCollisionDetector:
         self.compute_collision_buffer_offsets(self.edge_colliding_edges_buffer_sizes, self.edge_colliding_edges_offsets)
         self.edge_colliding_edges_min_dist = wp.array(shape=(model.edge_count,), dtype=float, device=self.device)
 
+        # AL contact state: one slot per potential contact pair
+        total_vt_slots = model.particle_count * self.vertex_collision_buffer_pre_alloc
+        self.vt_al_lambda = wp.zeros(shape=(total_vt_slots,), dtype=float, device=self.device)
+        self.vt_al_gamma = wp.ones(shape=(total_vt_slots,), dtype=float, device=self.device)
+
+        total_ee_slots = model.edge_count * self.edge_collision_buffer_pre_alloc
+        self.ee_al_lambda = wp.zeros(shape=(total_ee_slots,), dtype=float, device=self.device)
+        self.ee_al_gamma = wp.ones(shape=(total_ee_slots,), dtype=float, device=self.device)
+
         self.lower_bounds_edges = wp.array(shape=(model.edge_count,), dtype=wp.vec3, device=model.device)
         self.upper_bounds_edges = wp.array(shape=(model.edge_count,), dtype=wp.vec3, device=model.device)
         wp.launch(
@@ -293,6 +310,11 @@ class TriMeshCollisionDetector:
         collision_info.edge_colliding_edges_buffer_sizes = self.edge_colliding_edges_buffer_sizes
         collision_info.edge_colliding_edges_count = self.edge_colliding_edges_count
         collision_info.edge_colliding_edges_min_dist = self.edge_colliding_edges_min_dist
+
+        collision_info.vt_al_lambda = self.vt_al_lambda
+        collision_info.vt_al_gamma = self.vt_al_gamma
+        collision_info.ee_al_lambda = self.ee_al_lambda
+        collision_info.ee_al_gamma = self.ee_al_gamma
 
         return collision_info
 

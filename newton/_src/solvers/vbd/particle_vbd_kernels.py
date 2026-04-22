@@ -3689,3 +3689,478 @@ def compute_jgs2_precomputation_numpy(
     print(f"[JGS2] cubature weights: nnz={nnz}/{total_adj_face_entries}, "
           f"max={cubature_weights.max():.4f}, mean_pos={cubature_weights[cubature_weights>0].mean() if nnz else 0:.4f}")
     return cubature_weights
+
+
+# ===== Augmented Lagrangian Contact =====
+# Algorithm 2 from "A GPU-Accelerated Augmented Lagrangian..." (arXiv 2512.12151)
+# Contact constraint: c_i(x) = d_i(x) - r  (negative = penetrating)
+# AL energy term:     (mu*gamma_i / 2) * |c_i - lambda_i/mu|^2  when active (c_i - lambda_i/mu < 0)
+# Contact gradient:   g = mu*gamma_i * (c_i - lambda_i/mu) * grad_d  (active only)
+# Contact Hessian:    H = mu*gamma_i * outer(n, n)  (active only)
+# Multiplier update:  if active: lambda -= mu*c,  gamma *= Gamma(=0.9)
+#                     else:      lambda = 0,       gamma = 1
+
+
+@wp.func
+def evaluate_al_contact_force_norm(dis: float, collision_radius: float, al_mu: float, al_lambda: float, al_gamma: float):
+    """Augmented Lagrangian contact normal force magnitude and Hessian scalar.
+
+    Returns (dEdD, d2EdDdD) using the same sign convention as evaluate_self_contact_force_norm:
+      - dEdD is negative when constraint is active (force pushes apart)
+      - d2EdDdD is the Hessian scalar (always non-negative)
+    """
+    c = dis - collision_radius  # constraint value: negative when penetrating
+    effective = c - al_lambda / al_mu  # augmented constraint: active when < 0
+    if effective < 0.0:
+        # dE/dD = mu*gamma * effective  (negative since effective < 0)
+        dEdD = al_mu * al_gamma * effective
+        d2EdDdD = al_mu * al_gamma
+    else:
+        dEdD = float(0.0)
+        d2EdDdD = float(0.0)
+    return dEdD, d2EdDdD
+
+
+@wp.func
+def evaluate_vertex_triangle_al_contact_4_vertices(
+    v: int,
+    tri: int,
+    pos: wp.array(dtype=wp.vec3),
+    pos_anchor: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_radius: float,
+    al_mu: float,
+    al_lambda: float,
+    al_gamma: float,
+    collision_damping: float,
+    friction_coefficient: float,
+    friction_epsilon: float,
+    dt: float,
+):
+    """AL contact force and Hessian for a vertex-triangle pair (all 4 vertices).
+
+    Same structure as evaluate_vertex_triangle_collision_force_hessian_4_vertices
+    but uses AL formula instead of penalty spring.
+    """
+    a = pos[tri_indices[tri, 0]]
+    b = pos[tri_indices[tri, 1]]
+    c = pos[tri_indices[tri, 2]]
+    p = pos[v]
+
+    closest_p, bary, _feature_type = triangle_closest_point(a, b, c, p)
+    diff = p - closest_p
+    dis = wp.length(diff)
+
+    if 0.0 < dis < collision_radius * 2.0:
+        collision_normal = diff / dis
+        bs = wp.vec4(-bary[0], -bary[1], -bary[2], 1.0)
+
+        dEdD, d2EdDdD = evaluate_al_contact_force_norm(dis, collision_radius, al_mu, al_lambda, al_gamma)
+
+        if d2EdDdD > 0.0:
+            collision_force = -dEdD * collision_normal
+            collision_hessian = d2EdDdD * wp.outer(collision_normal, collision_normal)
+
+            # friction
+            dx_v = p - pos_anchor[v]
+            closest_p_prev = (
+                bary[0] * pos_anchor[tri_indices[tri, 0]]
+                + bary[1] * pos_anchor[tri_indices[tri, 1]]
+                + bary[2] * pos_anchor[tri_indices[tri, 2]]
+            )
+            dx = dx_v - (closest_p - closest_p_prev)
+            e0, e1 = build_orthonormal_basis(collision_normal)
+            T = mat32(e0[0], e1[0], e0[1], e1[1], e0[2], e1[2])
+            u = wp.transpose(T) * dx
+            eps_U = friction_epsilon * dt
+            friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+
+            collision_force_0 = collision_force * bs[0]
+            collision_force_1 = collision_force * bs[1]
+            collision_force_2 = collision_force * bs[2]
+            collision_force_3 = collision_force * bs[3]
+
+            collision_hessian_0 = collision_hessian * bs[0] * bs[0]
+            collision_hessian_1 = collision_hessian * bs[1] * bs[1]
+            collision_hessian_2 = collision_hessian * bs[2] * bs[2]
+            collision_hessian_3 = collision_hessian * bs[3] * bs[3]
+
+            collision_normal_sign = wp.vec4(-1.0, -1.0, -1.0, 1.0)
+
+            damping_force, damping_hessian = damp_collision(
+                pos_anchor[tri_indices[tri, 0]] - a, collision_normal * collision_normal_sign[0],
+                collision_hessian_0, collision_damping, dt,
+            )
+            collision_force_0 += damping_force + bs[0] * friction_force
+            collision_hessian_0 += damping_hessian + bs[0] * bs[0] * friction_hessian
+
+            damping_force, damping_hessian = damp_collision(
+                pos_anchor[tri_indices[tri, 1]] - b, collision_normal * collision_normal_sign[1],
+                collision_hessian_1, collision_damping, dt,
+            )
+            collision_force_1 += damping_force + bs[1] * friction_force
+            collision_hessian_1 += damping_hessian + bs[1] * bs[1] * friction_hessian
+
+            damping_force, damping_hessian = damp_collision(
+                pos_anchor[tri_indices[tri, 2]] - c, collision_normal * collision_normal_sign[2],
+                collision_hessian_2, collision_damping, dt,
+            )
+            collision_force_2 += damping_force + bs[2] * friction_force
+            collision_hessian_2 += damping_hessian + bs[2] * bs[2] * friction_hessian
+
+            damping_force, damping_hessian = damp_collision(
+                pos_anchor[v] - p, collision_normal * collision_normal_sign[3],
+                collision_hessian_3, collision_damping, dt,
+            )
+            collision_force_3 += damping_force + bs[3] * friction_force
+            collision_hessian_3 += damping_hessian + bs[3] * bs[3] * friction_hessian
+
+            return (
+                True,
+                collision_force_0, collision_force_1, collision_force_2, collision_force_3,
+                collision_hessian_0, collision_hessian_1, collision_hessian_2, collision_hessian_3,
+            )
+
+    zero_f = wp.vec3(0.0, 0.0, 0.0)
+    zero_h = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return False, zero_f, zero_f, zero_f, zero_f, zero_h, zero_h, zero_h, zero_h
+
+
+@wp.func
+def evaluate_ee_al_contact_2_vertices(
+    e1: int,
+    e2: int,
+    pos: wp.array(dtype=wp.vec3),
+    pos_anchor: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_radius: float,
+    al_mu: float,
+    al_lambda: float,
+    al_gamma: float,
+    collision_damping: float,
+    friction_coefficient: float,
+    friction_epsilon: float,
+    dt: float,
+    edge_edge_parallel_epsilon: float,
+):
+    """AL contact force and Hessian for an edge-edge pair (2 vertices on e1 side).
+
+    Same structure as evaluate_edge_edge_contact_2_vertices but uses AL formula.
+    """
+    e1_v1 = edge_indices[e1, 2]
+    e1_v2 = edge_indices[e1, 3]
+    e2_v1 = edge_indices[e2, 2]
+    e2_v2 = edge_indices[e2, 3]
+
+    e1_v1_pos = pos[e1_v1]
+    e1_v2_pos = pos[e1_v2]
+    e2_v1_pos = pos[e2_v1]
+    e2_v2_pos = pos[e2_v2]
+
+    st = wp.closest_point_edge_edge(e1_v1_pos, e1_v2_pos, e2_v1_pos, e2_v2_pos, edge_edge_parallel_epsilon)
+    s = st[0]
+    t = st[1]
+    e1_vec = e1_v2_pos - e1_v1_pos
+    e2_vec = e2_v2_pos - e2_v1_pos
+    c1 = e1_v1_pos + e1_vec * s
+    c2 = e2_v1_pos + e2_vec * t
+
+    diff = c1 - c2
+    dis = st[2]
+
+    if 0.0 < dis < collision_radius * 2.0:
+        collision_normal = diff / dis
+        bs = wp.vec4(1.0 - s, s, -(1.0 - t), -t)
+
+        dEdD, d2EdDdD = evaluate_al_contact_force_norm(dis, collision_radius, al_mu, al_lambda, al_gamma)
+
+        if d2EdDdD > 0.0:
+            collision_force = -dEdD * collision_normal
+            collision_hessian = d2EdDdD * wp.outer(collision_normal, collision_normal)
+
+            # friction
+            c1_prev = pos_anchor[e1_v1] + (pos_anchor[e1_v2] - pos_anchor[e1_v1]) * s
+            c2_prev = pos_anchor[e2_v1] + (pos_anchor[e2_v2] - pos_anchor[e2_v1]) * t
+            dx = (c1 - c1_prev) - (c2 - c2_prev)
+            axis_1, axis_2 = build_orthonormal_basis(collision_normal)
+            T = mat32(axis_1[0], axis_2[0], axis_1[1], axis_2[1], axis_1[2], axis_2[2])
+            u = wp.transpose(T) * dx
+            eps_U = friction_epsilon * dt
+            friction_force, friction_hessian = compute_friction(friction_coefficient, -dEdD, T, u, eps_U)
+
+            collision_force_0 = collision_force * bs[0]
+            collision_force_1 = collision_force * bs[1]
+            collision_hessian_0 = collision_hessian * bs[0] * bs[0]
+            collision_hessian_1 = collision_hessian * bs[1] * bs[1]
+
+            # damping and friction for e1 side
+            if wp.dot(pos_anchor[e1_v1] - e1_v1_pos, collision_normal) > 0.0:
+                dh = (collision_damping / dt) * collision_hessian_0
+                collision_hessian_0 += dh
+                collision_force_0 += dh * (pos_anchor[e1_v1] - e1_v1_pos)
+            collision_force_0 += friction_force * bs[0]
+            collision_hessian_0 += friction_hessian * bs[0] * bs[0]
+
+            if wp.dot(pos_anchor[e1_v2] - e1_v2_pos, collision_normal) > 0.0:
+                dh = (collision_damping / dt) * collision_hessian_1
+                collision_hessian_1 += dh
+                collision_force_1 += dh * (pos_anchor[e1_v2] - e1_v2_pos)
+            collision_force_1 += friction_force * bs[1]
+            collision_hessian_1 += friction_hessian * bs[1] * bs[1]
+
+            return True, collision_force_0, collision_force_1, collision_hessian_0, collision_hessian_1
+
+    zero_f = wp.vec3(0.0, 0.0, 0.0)
+    zero_h = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return False, zero_f, zero_f, zero_h, zero_h
+
+
+@wp.kernel
+def accumulate_al_contact_force_and_hessian(
+    dt: float,
+    current_color: int,
+    pos_anchor: wp.array(dtype=wp.vec3),
+    pos: wp.array(dtype=wp.vec3),
+    particle_colors: wp.array(dtype=int),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    # self contact + AL state
+    collision_info_array: wp.array(dtype=TriMeshCollisionInfo),
+    collision_radius: float,
+    al_mu: float,
+    soft_contact_kd: float,
+    friction_mu: float,
+    friction_epsilon: float,
+    edge_edge_parallel_epsilon: float,
+    # body-particle contact (same as original kernel)
+    particle_radius: wp.array(dtype=float),
+    body_particle_contact_particle: wp.array(dtype=int),
+    body_particle_contact_count: wp.array(dtype=int),
+    body_particle_contact_max: int,
+    body_particle_contact_penalty_k: wp.array(dtype=float),
+    body_particle_contact_material_kd: wp.array(dtype=float),
+    body_particle_contact_material_mu: wp.array(dtype=float),
+    shape_material_mu: wp.array(dtype=float),
+    shape_body: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    body_q_prev: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    body_com: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    contact_body_pos: wp.array(dtype=wp.vec3),
+    contact_body_vel: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    # outputs
+    particle_forces: wp.array(dtype=wp.vec3),
+    particle_hessians: wp.array(dtype=wp.mat33),
+):
+    t_id = wp.tid()
+    collision_info = collision_info_array[0]
+
+    primitive_id = t_id // NUM_THREADS_PER_COLLISION_PRIMITIVE
+    t_id_current_primitive = t_id % NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # --- EE contacts ---
+    if primitive_id < collision_info.edge_colliding_edges_buffer_sizes.shape[0]:
+        e1_idx = primitive_id
+        collision_buffer_counter = t_id_current_primitive
+        collision_buffer_offset = collision_info.edge_colliding_edges_offsets[primitive_id]
+
+        while collision_buffer_counter < collision_info.edge_colliding_edges_buffer_sizes[primitive_id]:
+            e2_idx = collision_info.edge_colliding_edges[2 * (collision_buffer_offset + collision_buffer_counter) + 1]
+
+            if e1_idx != -1 and e2_idx != -1:
+                e1_v1 = edge_indices[e1_idx, 2]
+                e1_v2 = edge_indices[e1_idx, 3]
+
+                c_e1_v1 = particle_colors[e1_v1]
+                c_e1_v2 = particle_colors[e1_v2]
+                if c_e1_v1 == current_color or c_e1_v2 == current_color:
+                    slot = collision_buffer_offset + collision_buffer_counter
+                    al_lambda = collision_info.ee_al_lambda[slot]
+                    al_gamma = collision_info.ee_al_gamma[slot]
+
+                    has_contact, force_0, force_1, hess_0, hess_1 = evaluate_ee_al_contact_2_vertices(
+                        e1_idx, e2_idx, pos, pos_anchor, edge_indices,
+                        collision_radius, al_mu, al_lambda, al_gamma,
+                        soft_contact_kd, friction_mu, friction_epsilon, dt, edge_edge_parallel_epsilon,
+                    )
+                    if has_contact:
+                        if c_e1_v1 == current_color:
+                            wp.atomic_add(particle_forces, e1_v1, force_0)
+                            wp.atomic_add(particle_hessians, e1_v1, hess_0)
+                        if c_e1_v2 == current_color:
+                            wp.atomic_add(particle_forces, e1_v2, force_1)
+                            wp.atomic_add(particle_hessians, e1_v2, hess_1)
+
+            collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # --- VT contacts ---
+    if primitive_id < collision_info.vertex_colliding_triangles_buffer_sizes.shape[0]:
+        particle_idx = primitive_id
+        collision_buffer_counter = t_id_current_primitive
+        collision_buffer_offset = collision_info.vertex_colliding_triangles_offsets[primitive_id]
+
+        while collision_buffer_counter < collision_info.vertex_colliding_triangles_buffer_sizes[primitive_id]:
+            tri_idx = collision_info.vertex_colliding_triangles[
+                (collision_buffer_offset + collision_buffer_counter) * 2 + 1
+            ]
+
+            if particle_idx != -1 and tri_idx != -1:
+                tri_a = tri_indices[tri_idx, 0]
+                tri_b = tri_indices[tri_idx, 1]
+                tri_c = tri_indices[tri_idx, 2]
+
+                c_v = particle_colors[particle_idx]
+                c_tri_a = particle_colors[tri_a]
+                c_tri_b = particle_colors[tri_b]
+                c_tri_c = particle_colors[tri_c]
+
+                if c_v == current_color or c_tri_a == current_color or c_tri_b == current_color or c_tri_c == current_color:
+                    slot = collision_buffer_offset + collision_buffer_counter
+                    al_lambda = collision_info.vt_al_lambda[slot]
+                    al_gamma = collision_info.vt_al_gamma[slot]
+
+                    (
+                        has_contact, f0, f1, f2, f3, h0, h1, h2, h3,
+                    ) = evaluate_vertex_triangle_al_contact_4_vertices(
+                        particle_idx, tri_idx, pos, pos_anchor, tri_indices,
+                        collision_radius, al_mu, al_lambda, al_gamma,
+                        soft_contact_kd, friction_mu, friction_epsilon, dt,
+                    )
+
+                    if has_contact:
+                        if c_v == current_color:
+                            wp.atomic_add(particle_forces, particle_idx, f3)
+                            wp.atomic_add(particle_hessians, particle_idx, h3)
+                        if c_tri_a == current_color:
+                            wp.atomic_add(particle_forces, tri_a, f0)
+                            wp.atomic_add(particle_hessians, tri_a, h0)
+                        if c_tri_b == current_color:
+                            wp.atomic_add(particle_forces, tri_b, f1)
+                            wp.atomic_add(particle_hessians, tri_b, h1)
+                        if c_tri_c == current_color:
+                            wp.atomic_add(particle_forces, tri_c, f2)
+                            wp.atomic_add(particle_hessians, tri_c, h2)
+
+            collision_buffer_counter += NUM_THREADS_PER_COLLISION_PRIMITIVE
+
+    # --- Body-particle contacts (unchanged from original) ---
+    particle_body_contact_count = wp.min(body_particle_contact_max, body_particle_contact_count[0])
+    if t_id < particle_body_contact_count:
+        particle_idx = body_particle_contact_particle[t_id]
+        if particle_colors[particle_idx] == current_color:
+            contact_ke = body_particle_contact_penalty_k[t_id]
+            contact_kd = body_particle_contact_material_kd[t_id]
+            contact_mu = body_particle_contact_material_mu[t_id]
+            body_contact_force, body_contact_hessian = evaluate_body_particle_contact(
+                particle_idx, pos[particle_idx], pos_anchor[particle_idx], t_id,
+                contact_ke, contact_kd, contact_mu, friction_epsilon,
+                particle_radius, shape_material_mu, shape_body,
+                body_q, body_q_prev, body_qd, body_com,
+                contact_shape, contact_body_pos, contact_body_vel, contact_normal, dt,
+            )
+            wp.atomic_add(particle_forces, particle_idx, body_contact_force)
+            wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+
+
+@wp.kernel
+def update_al_multipliers_vt(
+    pos: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_info_array: wp.array(dtype=TriMeshCollisionInfo),
+    collision_radius: float,
+    al_mu: float,
+    al_Gamma: float,
+    vt_al_lambda: wp.array(dtype=float),
+    vt_al_gamma: wp.array(dtype=float),
+):
+    """Update AL multipliers (lambda, gamma) for VT contacts after a VBD iteration.
+
+    Algorithm 2, lines 22-27 from arXiv 2512.12151:
+      active   -> lambda -= mu*c,  gamma *= Gamma
+      inactive -> lambda = 0,      gamma = 1
+    """
+    v_id = wp.tid()
+    info = collision_info_array[0]
+    count = wp.min(
+        info.vertex_colliding_triangles_count[v_id],
+        info.vertex_colliding_triangles_buffer_sizes[v_id],
+    )
+    offset = info.vertex_colliding_triangles_offsets[v_id]
+
+    for i in range(count):
+        slot = offset + i
+        tri_id = info.vertex_colliding_triangles[2 * slot + 1]
+        if tri_id == -1:
+            continue
+
+        v_pos = pos[v_id]
+        a = pos[tri_indices[tri_id, 0]]
+        b = pos[tri_indices[tri_id, 1]]
+        c_pos = pos[tri_indices[tri_id, 2]]
+
+        closest_p, _bary, _ft = triangle_closest_point(a, b, c_pos, v_pos)
+        dis = wp.length(v_pos - closest_p)
+        c_val = dis - collision_radius
+
+        lam = vt_al_lambda[slot]
+        gam = vt_al_gamma[slot]
+        effective = c_val - lam / al_mu
+
+        if effective < 0.0:
+            vt_al_lambda[slot] = lam - al_mu * c_val
+            vt_al_gamma[slot] = gam * al_Gamma
+        else:
+            vt_al_lambda[slot] = float(0.0)
+            vt_al_gamma[slot] = float(1.0)
+
+
+@wp.kernel
+def update_al_multipliers_ee(
+    pos: wp.array(dtype=wp.vec3),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_info_array: wp.array(dtype=TriMeshCollisionInfo),
+    collision_radius: float,
+    al_mu: float,
+    al_Gamma: float,
+    edge_edge_parallel_epsilon: float,
+    ee_al_lambda: wp.array(dtype=float),
+    ee_al_gamma: wp.array(dtype=float),
+):
+    """Update AL multipliers for EE contacts after a VBD iteration."""
+    e1_id = wp.tid()
+    info = collision_info_array[0]
+    count = wp.min(
+        info.edge_colliding_edges_count[e1_id],
+        info.edge_colliding_edges_buffer_sizes[e1_id],
+    )
+    offset = info.edge_colliding_edges_offsets[e1_id]
+
+    for i in range(count):
+        slot = offset + i
+        e2_id = info.edge_colliding_edges[2 * slot + 1]
+        if e2_id == -1:
+            continue
+
+        e1_v1 = edge_indices[e1_id, 2]
+        e1_v2 = edge_indices[e1_id, 3]
+        e2_v1 = edge_indices[e2_id, 2]
+        e2_v2 = edge_indices[e2_id, 3]
+
+        st = wp.closest_point_edge_edge(
+            pos[e1_v1], pos[e1_v2], pos[e2_v1], pos[e2_v2], edge_edge_parallel_epsilon
+        )
+        dis = st[2]
+        c_val = dis - collision_radius
+
+        lam = ee_al_lambda[slot]
+        gam = ee_al_gamma[slot]
+        effective = c_val - lam / al_mu
+
+        if effective < 0.0:
+            ee_al_lambda[slot] = lam - al_mu * c_val
+            ee_al_gamma[slot] = gam * al_Gamma
+        else:
+            ee_al_lambda[slot] = float(0.0)
+            ee_al_gamma[slot] = float(1.0)

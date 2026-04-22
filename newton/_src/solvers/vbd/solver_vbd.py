@@ -56,6 +56,10 @@ from .particle_vbd_kernels import (
     solve_trimesh_with_self_contact_penetration_free,
     solve_trimesh_with_self_contact_penetration_free_tile,
     update_velocity,
+    # Augmented Lagrangian contact kernels
+    accumulate_al_contact_force_and_hessian,
+    update_al_multipliers_vt,
+    update_al_multipliers_ee,
 )
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
@@ -172,6 +176,9 @@ class SolverVBD(SolverBase):
 
         ogc_contact: bool = False,
         coordinate_condensation: bool = False,
+        use_al_contact: bool = False,
+        al_mu: float = 0.0,
+        al_Gamma: float = 0.9,
     ):
         """
         Args:
@@ -251,12 +258,21 @@ class SolverVBD(SolverBase):
 
         """
         super().__init__(model)
-        
+
         self.ogc_contact = ogc_contact
         self.use_coord_condensation = 1 if coordinate_condensation else 0
         if self.ogc_contact:
             print()
             print(">>> OGC Contact mode ON <<<")
+            print()
+
+        self.use_al_contact = use_al_contact
+        # mu_init = C * max_diag(∇²E), C=0.1 (Section 5.2). Fall back to soft_contact_ke when not provided.
+        if use_al_contact:
+            self.al_mu = al_mu if al_mu > 0.0 else float(model.soft_contact_ke)
+            self.al_Gamma = al_Gamma
+            print()
+            print(f">>> AL Contact mode ON  (mu={self.al_mu:.3g}, Gamma={self.al_Gamma}) <<<")
             print()
 
         # Common parameters
@@ -991,6 +1007,10 @@ class SolverVBD(SolverBase):
             self.solve_rigid_body_iteration(state_in, state_out, contacts, dt)
             self.solve_particle_iteration(state_in, state_out, contacts, dt, iter_num, self.iterations-1)
 
+            # AL multiplier update: λ, γ per contact pair after each VBD iteration
+            if self.use_al_contact and self.particle_enable_self_contact:
+                self._update_al_multipliers(state_out)
+
         self.finalize_rigid_bodies(state_out, dt)
         self.finalize_particles(state_out, dt)
 
@@ -1352,6 +1372,52 @@ class SolverVBD(SolverBase):
                                 self.contacts_friction3,
                                 self.contacts_v_list,
                                 self.contacts_mu
+                            ],
+                            device=self.device,
+                            max_blocks=model.device.sm_count,
+                        )
+                    elif self.use_al_contact:
+                        wp.launch(
+                            kernel=accumulate_al_contact_force_and_hessian,
+                            dim=self.collision_evaluation_kernel_launch_size,
+                            inputs=[
+                                dt,
+                                color,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                model.particle_colors,
+                                model.tri_indices,
+                                model.edge_indices,
+                                # self-contact with AL state
+                                self.trimesh_collision_info,
+                                self.particle_self_contact_radius,
+                                self.al_mu,
+                                model.soft_contact_kd,
+                                model.soft_contact_mu,
+                                self.friction_epsilon,
+                                self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                                # body-particle contact
+                                model.particle_radius,
+                                contacts.soft_contact_particle,
+                                contacts.soft_contact_count,
+                                contacts.soft_contact_max,
+                                self.body_particle_contact_penalty_k,
+                                self.body_particle_contact_material_kd,
+                                self.body_particle_contact_material_mu,
+                                model.shape_material_mu,
+                                model.shape_body,
+                                body_q_for_particles,
+                                body_q_prev_for_particles,
+                                body_qd_for_particles,
+                                model.body_com,
+                                contacts.soft_contact_shape,
+                                contacts.soft_contact_body_pos,
+                                contacts.soft_contact_body_vel,
+                                contacts.soft_contact_normal,
+                            ],
+                            outputs=[
+                                self.particle_forces,
+                                self.particle_hessians,
                             ],
                             device=self.device,
                             max_blocks=model.device.sm_count,
@@ -2000,6 +2066,13 @@ class SolverVBD(SolverBase):
                 min_distance_filtering_ref_pos=self.particle_q_rest,
             )
 
+        # Reset AL multipliers for the freshly detected contact set (lambda=0, gamma=1)
+        if self.use_al_contact:
+            self.trimesh_collision_detector.vt_al_lambda.fill_(0.0)
+            self.trimesh_collision_detector.vt_al_gamma.fill_(1.0)
+            self.trimesh_collision_detector.ee_al_lambda.fill_(0.0)
+            self.trimesh_collision_detector.ee_al_gamma.fill_(1.0)
+
         self.pos_prev_collision_detection.assign(current_state.particle_q)
         wp.launch(
             kernel=compute_particle_conservative_bound,
@@ -2017,6 +2090,49 @@ class SolverVBD(SolverBase):
         )
 
     
+    def _update_al_multipliers(self, state_out: State):
+        """Update AL multipliers (lambda, gamma) for all contact pairs after a VBD iteration.
+
+        Algorithm 2, lines 22-27 from arXiv 2512.12151.
+        Uses state_out.particle_q (positions after the solve) to evaluate constraint values.
+        """
+        model = self.model
+        det = self.trimesh_collision_detector
+
+        wp.launch(
+            kernel=update_al_multipliers_vt,
+            dim=model.particle_count,
+            inputs=[
+                state_out.particle_q,
+                model.tri_indices,
+                self.trimesh_collision_info,
+                self.particle_self_contact_radius,
+                self.al_mu,
+                self.al_Gamma,
+                det.vt_al_lambda,
+                det.vt_al_gamma,
+            ],
+            device=self.device,
+        )
+
+        if model.edge_count > 0:
+            wp.launch(
+                kernel=update_al_multipliers_ee,
+                dim=model.edge_count,
+                inputs=[
+                    state_out.particle_q,
+                    model.edge_indices,
+                    self.trimesh_collision_info,
+                    self.particle_self_contact_radius,
+                    self.al_mu,
+                    self.al_Gamma,
+                    self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                    det.ee_al_lambda,
+                    det.ee_al_gamma,
+                ],
+                device=self.device,
+            )
+
     # called on init(1 time) and solve(iteration times)
     def collision_detection_penetration_free_log_collision(self, current_state: State, iter_num=-2):
         self.trimesh_collision_detector.refit(current_state.particle_q)
