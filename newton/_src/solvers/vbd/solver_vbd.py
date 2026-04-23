@@ -39,6 +39,8 @@ from .particle_vbd_kernels import (
     accumulate_spring_force_and_hessian,
     build_edge_n_ring_edge_collision_filter,
     build_vertex_n_ring_tris_collision_filter,
+    ANISOTROPIC_BOUND_MAX_HALF_SPACES,
+    compute_particle_anisotropic_bound,
     compute_particle_conservative_bound,
     copy_particle_positions_back,
     # Adjacency building kernels
@@ -57,7 +59,6 @@ from .particle_vbd_kernels import (
     solve_trimesh_with_self_contact_penetration_free_tile,
     update_velocity,
     # Augmented Lagrangian contact kernels
-    accumulate_al_contact_force_and_hessian,
     update_al_multipliers_vt,
     update_al_multipliers_ee,
 )
@@ -267,9 +268,16 @@ class SolverVBD(SolverBase):
             print()
 
         self.use_al_contact = use_al_contact
-        # mu_init = C * max_diag(∇²E), C=0.1 (Section 5.2). Fall back to soft_contact_ke when not provided.
         if use_al_contact:
-            self.al_mu = al_mu if al_mu > 0.0 else float(model.soft_contact_ke)
+            if al_mu > 0.0:
+                self.al_mu = al_mu
+            elif model.tri_materials is not None and model.tri_materials.shape[0] > 0:
+                # Section 5.2: μ = 0.1 × max_diag(K_elastic)
+                # K_elastic diagonal ≈ max tri_ke (Young's modulus contribution per vertex)
+                tri_ke_max = float(model.tri_materials.numpy()[:, 0].max())
+                self.al_mu = 0.1 * tri_ke_max
+            else:
+                self.al_mu = float(model.soft_contact_ke)
             self.al_Gamma = al_Gamma
             print()
             print(f">>> AL Contact mode ON  (mu={self.al_mu:.3g}, Gamma={self.al_Gamma}) <<<")
@@ -384,7 +392,16 @@ class SolverVBD(SolverBase):
 
             self.particle_conservative_bound_relaxation = particle_conservative_bound_relaxation
             self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
-            self.particle_conservative_bounds = wp.zeros((model.particle_count,), dtype=float, device=self.device)
+            max_hs = int(ANISOTROPIC_BOUND_MAX_HALF_SPACES)
+            self.particle_conservative_half_spaces = wp.zeros(
+                (model.particle_count * max_hs,), dtype=wp.vec4, device=self.device
+            )
+            self.particle_conservative_n_half_spaces = wp.zeros(
+                (model.particle_count,), dtype=wp.int32, device=self.device
+            )
+            self.particle_conservative_bounds = wp.zeros(
+                (model.particle_count,), dtype=float, device=self.device
+            )
 
             self.trimesh_collision_detector = TriMeshCollisionDetector(
                 self.model,
@@ -1041,6 +1058,8 @@ class SolverVBD(SolverBase):
                     state_in.particle_f,
                     model.particle_flags,
                     self.pos_prev_collision_detection,
+                    self.particle_conservative_half_spaces,
+                    self.particle_conservative_n_half_spaces,
                     self.particle_conservative_bounds,
                     self.inertia,
                 ],
@@ -1376,52 +1395,6 @@ class SolverVBD(SolverBase):
                             device=self.device,
                             max_blocks=model.device.sm_count,
                         )
-                    elif self.use_al_contact:
-                        wp.launch(
-                            kernel=accumulate_al_contact_force_and_hessian,
-                            dim=self.collision_evaluation_kernel_launch_size,
-                            inputs=[
-                                dt,
-                                color,
-                                self.particle_q_prev,
-                                state_in.particle_q,
-                                model.particle_colors,
-                                model.tri_indices,
-                                model.edge_indices,
-                                # self-contact with AL state
-                                self.trimesh_collision_info,
-                                self.particle_self_contact_radius,
-                                self.al_mu,
-                                model.soft_contact_kd,
-                                model.soft_contact_mu,
-                                self.friction_epsilon,
-                                self.trimesh_collision_detector.edge_edge_parallel_epsilon,
-                                # body-particle contact
-                                model.particle_radius,
-                                contacts.soft_contact_particle,
-                                contacts.soft_contact_count,
-                                contacts.soft_contact_max,
-                                self.body_particle_contact_penalty_k,
-                                self.body_particle_contact_material_kd,
-                                self.body_particle_contact_material_mu,
-                                model.shape_material_mu,
-                                model.shape_body,
-                                body_q_for_particles,
-                                body_q_prev_for_particles,
-                                body_qd_for_particles,
-                                model.body_com,
-                                contacts.soft_contact_shape,
-                                contacts.soft_contact_body_pos,
-                                contacts.soft_contact_body_vel,
-                                contacts.soft_contact_normal,
-                            ],
-                            outputs=[
-                                self.particle_forces,
-                                self.particle_hessians,
-                            ],
-                            device=self.device,
-                            max_blocks=model.device.sm_count,
-                        )
                     else:
                         wp.launch(
                             kernel=accumulate_contact_force_and_hessian,
@@ -1557,6 +1530,8 @@ class SolverVBD(SolverBase):
                             self.particle_forces,
                             self.particle_hessians,
                             self.pos_prev_collision_detection,
+                            self.particle_conservative_half_spaces,
+                            self.particle_conservative_n_half_spaces,
                             self.particle_conservative_bounds,
                         ],
                         outputs=[
@@ -1590,11 +1565,13 @@ class SolverVBD(SolverBase):
                             self.particle_forces,
                             self.particle_hessians,
                             self.pos_prev_collision_detection,
+                            self.particle_conservative_half_spaces,
+                            self.particle_conservative_n_half_spaces,
                             self.particle_conservative_bounds,
                         ],
                         outputs=[
                             state_out.particle_q,
-                            self.stvk_forces    
+                            self.stvk_forces
                         ],
                         device=self.device,
                     )
@@ -2082,14 +2059,32 @@ class SolverVBD(SolverBase):
                 self.particle_adjacency,
                 self.trimesh_collision_detector.collision_info,
             ],
+            outputs=[self.particle_conservative_bounds],
+            dim=self.model.particle_count,
+            device=self.device,
+        )
+        al_mu = self.al_mu if self.use_al_contact else 0.0
+        wp.launch(
+            kernel=compute_particle_anisotropic_bound,
+            inputs=[
+                self.particle_conservative_bound_relaxation,
+                al_mu,
+                self.pos_prev_collision_detection,
+                self.model.tri_indices,
+                self.model.edge_indices,
+                self.particle_adjacency,
+                self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                self.trimesh_collision_detector.collision_info,
+            ],
             outputs=[
-                self.particle_conservative_bounds,
+                self.particle_conservative_half_spaces,
+                self.particle_conservative_n_half_spaces,
             ],
             dim=self.model.particle_count,
             device=self.device,
         )
 
-    
+
     def _update_al_multipliers(self, state_out: State):
         """Update AL multipliers (lambda, gamma) for all contact pairs after a VBD iteration.
 
@@ -2158,12 +2153,181 @@ class SolverVBD(SolverBase):
                 self.particle_adjacency,
                 self.trimesh_collision_detector.collision_info,
             ],
+            outputs=[self.particle_conservative_bounds],
+            dim=self.model.particle_count,
+            device=self.device,
+        )
+        al_mu = self.al_mu if self.use_al_contact else 0.0
+        wp.launch(
+            kernel=compute_particle_anisotropic_bound,
+            inputs=[
+                self.particle_conservative_bound_relaxation,
+                al_mu,
+                self.pos_prev_collision_detection,
+                self.model.tri_indices,
+                self.model.edge_indices,
+                self.particle_adjacency,
+                self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                self.trimesh_collision_detector.collision_info,
+            ],
             outputs=[
-                self.particle_conservative_bounds,
+                self.particle_conservative_half_spaces,
+                self.particle_conservative_n_half_spaces,
             ],
             dim=self.model.particle_count,
             device=self.device,
         )
+
+    def al_debug_info(self):
+        """Return a dict of AL contact diagnostic values (CPU readback; do not call in hot loops).
+
+        Returns:
+            dict with keys:
+              al_mu           – penalty parameter μ
+              iterations      – VBD iterations per substep
+              n_vt_pairs      – total detected vertex-triangle contact slots
+              n_ee_pairs      – total detected edge-edge contact slots
+              max_vt_lambda   – max |λ| across all VT slots (proxy for penetration depth × μ)
+              max_ee_lambda   – max |λ| across all EE slots
+              hessian_norm_v0   – Frobenius norm of particle_hessians[0] (last substep, last iter)
+              v0_vt_count       – detected VT contact count for vertex 0 (0 = no contacts detected)
+              v0_active         – whether vertex 0 has ACTIVE particle flag
+              max_hess_vertex   – index of vertex with highest hessian norm
+              max_hess_norm     – that vertex's hessian Frobenius norm
+              n_nonzero_hess    – number of vertices with non-zero hessian
+              n_ee_slots_total  – total EE slots (counts each pair twice due to symmetric storage)
+              n_ee_canonical    – unique EE pairs (slots/2), i.e. actual physical contact pairs
+              ee_lambda_max_asymmetry – max |λ_e1→e2 - λ_e2→e1| across canonical pairs (should be 0)
+              overflow_vt       – True if VT buffer overflowed (contacts dropped)
+              overflow_ee       – True if EE buffer overflowed (contacts dropped)
+              vt_overflow_count – number of vertices whose detected count > buffer size
+              ee_overflow_count – number of edges whose detected count > buffer size
+              vt_max_ratio      – max(count/buffer_size) across all vertices (>1.0 means overflow)
+              ee_max_ratio      – max(count/buffer_size) across all edges
+        """
+        al_mu = getattr(self, "al_mu", float(self.model.soft_contact_ke))
+
+        det = getattr(self, "trimesh_collision_detector", None)
+        n_vt, n_ee, max_vt, max_ee = 0, 0, 0.0, 0.0
+        v0_vt_count = 0
+        n_ee_slots_total = 0
+        n_ee_canonical = 0
+        ee_lambda_max_asymmetry = 0.0
+        overflow_vt = False
+        overflow_ee = False
+        vt_overflow_count = 0
+        ee_overflow_count = 0
+        vt_max_ratio = 0.0
+        ee_max_ratio = 0.0
+        if det is not None:
+            if hasattr(det, "vertex_colliding_triangles_count"):
+                vt_counts = det.vertex_colliding_triangles_count.numpy()
+                n_vt = int(vt_counts.sum())
+                v0_vt_count = int(vt_counts[0]) if len(vt_counts) > 0 else 0
+            if hasattr(det, "edge_colliding_edges_count"):
+                ee_counts = det.edge_colliding_edges_count.numpy()
+                n_ee_slots_total = int(ee_counts.sum())
+                n_ee = n_ee_slots_total  # keep backward compat name
+            if hasattr(det, "vt_al_lambda"):
+                vt_lam = det.vt_al_lambda.numpy()
+                max_vt = float(np.max(np.abs(vt_lam))) if len(vt_lam) > 0 else 0.0
+            if hasattr(det, "ee_al_lambda") and hasattr(det, "edge_colliding_edges_count"):
+                ee_lam = det.ee_al_lambda.numpy()
+                max_ee = float(np.max(np.abs(ee_lam))) if len(ee_lam) > 0 else 0.0
+
+                # Check lambda asymmetry between e1→e2 and e2→e1 slots.
+                # Symmetric storage means each canonical pair (e1<e2) has two lambda slots.
+                # If updates are consistent, both should be equal at all times.
+                if (hasattr(det, "edge_colliding_edges") and hasattr(det, "edge_colliding_edges_offsets")
+                        and hasattr(self.model, "edge_count")):
+                    ee_buf = det.edge_colliding_edges.numpy()         # int32, (2*n_slots,): [edge_idx, other_idx, ...]
+                    ee_offsets = det.edge_colliding_edges_offsets.numpy()
+                    ee_counts_arr = det.edge_colliding_edges_count.numpy()
+                    n_edges = int(self.model.edge_count)
+                    # Build map: (e1, e2) -> lambda for e1 < e2 canonical pair
+                    lam_map = {}   # (min_e, max_e) -> list of lambda values
+                    for e1 in range(n_edges):
+                        cnt = int(ee_counts_arr[e1])
+                        off = int(ee_offsets[e1])
+                        for k in range(cnt):
+                            e2 = int(ee_buf[2 * (off + k) + 1])
+                            if e2 < 0:
+                                continue
+                            key = (min(e1, e2), max(e1, e2))
+                            lam_val = float(ee_lam[off + k])
+                            if key not in lam_map:
+                                lam_map[key] = []
+                            lam_map[key].append(lam_val)
+                    n_ee_canonical = len(lam_map)
+                    asym_vals = [abs(v[0] - v[1]) for v in lam_map.values() if len(v) == 2]
+                    ee_lambda_max_asymmetry = float(max(asym_vals)) if asym_vals else 0.0
+
+            # --- Buffer overflow check ---
+            # resize_flags: [VT_overflow, Tri_overflow, EE_overflow, TriTri_overflow]
+            if hasattr(det, "resize_flags"):
+                rf = det.resize_flags.numpy()
+                overflow_vt = bool(rf[0])
+                overflow_ee = bool(rf[2])
+
+            if hasattr(det, "vertex_colliding_triangles_count") and hasattr(det, "vertex_colliding_triangles_buffer_sizes"):
+                vt_cnt = det.vertex_colliding_triangles_count.numpy()
+                vt_buf = det.vertex_colliding_triangles_buffer_sizes.numpy()
+                vt_overflow_mask = vt_cnt > vt_buf
+                vt_overflow_count = int(vt_overflow_mask.sum())
+                ratio = vt_cnt.astype(float) / np.maximum(vt_buf.astype(float), 1.0)
+                vt_max_ratio = float(ratio.max()) if len(ratio) > 0 else 0.0
+
+            if hasattr(det, "edge_colliding_edges_count") and hasattr(det, "edge_colliding_edges_buffer_sizes"):
+                ee_cnt = det.edge_colliding_edges_count.numpy()
+                ee_buf_sizes = det.edge_colliding_edges_buffer_sizes.numpy()
+                ee_overflow_mask = ee_cnt > ee_buf_sizes
+                ee_overflow_count = int(ee_overflow_mask.sum())
+                ratio = ee_cnt.astype(float) / np.maximum(ee_buf_sizes.astype(float), 1.0)
+                ee_max_ratio = float(ratio.max()) if len(ratio) > 0 else 0.0
+
+        hess_norm = 0.0
+        max_hess_vertex = -1
+        max_hess_norm = 0.0
+        n_nonzero_hess = 0
+        v0_active = False
+        if hasattr(self, "particle_hessians") and self.particle_hessians is not None:
+            H = self.particle_hessians.numpy()
+            h0 = H[0]
+            hess_norm = float(np.linalg.norm(h0))
+            norms = np.linalg.norm(H.reshape(H.shape[0], -1), axis=1)
+            n_nonzero_hess = int((norms > 0).sum())
+            if n_nonzero_hess > 0:
+                max_hess_vertex = int(np.argmax(norms))
+                max_hess_norm = float(norms[max_hess_vertex])
+
+        if hasattr(self.model, "particle_flags") and self.model.particle_flags is not None:
+            from newton import ParticleFlags
+            flags = self.model.particle_flags.numpy()
+            v0_active = bool(flags[0] & ParticleFlags.ACTIVE) if len(flags) > 0 else False
+
+        return {
+            "al_mu": al_mu,
+            "iterations": self.iterations,
+            "n_vt_pairs": n_vt,
+            "n_ee_pairs": n_ee,
+            "max_vt_lambda": max_vt,
+            "max_ee_lambda": max_ee,
+            "hessian_norm_v0": hess_norm,
+            "v0_vt_count": v0_vt_count,
+            "v0_active": v0_active,
+            "max_hess_vertex": max_hess_vertex,
+            "max_hess_norm": max_hess_norm,
+            "n_nonzero_hess": n_nonzero_hess,
+            "n_ee_slots_total": n_ee_slots_total,
+            "n_ee_canonical": n_ee_canonical,
+            "ee_lambda_max_asymmetry": ee_lambda_max_asymmetry,
+            "overflow_vt": overflow_vt,
+            "overflow_ee": overflow_ee,
+            "vt_overflow_count": vt_overflow_count,
+            "ee_overflow_count": ee_overflow_count,
+            "vt_max_ratio": vt_max_ratio,
+            "ee_max_ratio": ee_max_ratio,
+        }
 
     def rebuild_bvh(self, state: State):
         """This function will rebuild the BVHs used for detecting self-contacts using the input `state`.

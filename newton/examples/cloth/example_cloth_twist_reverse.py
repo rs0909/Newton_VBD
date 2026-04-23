@@ -152,7 +152,7 @@ class Example:
         self.sim_substeps = 10  # must be an even number when using CUDA Graph
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.iterations = 4
+        self.iterations = 40
         # the BVH used by SolverVBD will be rebuilt every self.bvh_rebuild_frames
         # When the simulated object deforms significantly, simply refitting the BVH can lead to deterioration of the BVH's
         # quality, in this case we need to completely rebuild the tree to achieve better query efficiency.
@@ -217,13 +217,18 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=self.iterations,
+            particle_vertex_contact_buffer_size = 128,
+            particle_edge_contact_buffer_size = 256,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
             particle_self_contact_margin=0.0035,
-            use_al_contact=True,       # AL 활성화
-            al_mu=1e3,                 # μ (0이면 soft_contact_ke 사용)
-            al_Gamma=0.9,              # 감쇠 계수 Γ
+            # ogc_contact=True,
+            coordinate_condensation=True,
+            #use_al_contact=True,       # AL 활성화
+            #al_Gamma=0.9,              # 감쇠 계수 Γ
         )
+
+        
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -262,6 +267,8 @@ class Example:
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(2.25, 0.0, 0.0), 0.0, -180.0)
+
+        self._frame_count = 0
 
         # put graph capture into it's own function
         self.capture()
@@ -313,6 +320,23 @@ class Example:
             self.simulate()
 
         self.sim_time += self.frame_dt
+        self._frame_count += 1
+
+        # diagnostics: print every 10 frames
+        if self._frame_count % 10 == 0:
+            info = self.solver.al_debug_info()
+            ovf_vt = f"OVERFLOW({info['vt_overflow_count']}v,{info['vt_max_ratio']:.1f}x)" if info['overflow_vt'] else f"ok({info['vt_max_ratio']:.2f}x)"
+            ovf_ee = f"OVERFLOW({info['ee_overflow_count']}e,{info['ee_max_ratio']:.1f}x)" if info['overflow_ee'] else f"ok({info['ee_max_ratio']:.2f}x)"
+            print(
+                f"[frame={self._frame_count} t={self.sim_time:.2f}] "
+                f"AL={self.solver.use_al_contact}  μ={info['al_mu']:.3g}  "
+                f"VT_slots={info['n_vt_pairs']} buf={ovf_vt}  "
+                f"EE_slots={info['n_ee_slots_total']} canonical={info['n_ee_canonical']} buf={ovf_ee}  "
+                f"max|λ_vt|={info['max_vt_lambda']:.3g}  max|λ_ee|={info['max_ee_lambda']:.3g}  "
+                f"EE_λ_asym={info['ee_lambda_max_asymmetry']:.3g}  "
+                f"nonzero_H={info['n_nonzero_hess']}  "
+                f"max_H_v{info['max_hess_vertex']}={info['max_hess_norm']:.3g}"
+            )
 
     def render(self):
         if self.viewer is None:

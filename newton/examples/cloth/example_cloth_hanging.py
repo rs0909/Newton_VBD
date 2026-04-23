@@ -75,7 +75,7 @@ class Example:
 
         # common cloth properties
         common_params = {
-            "pos": wp.vec3(0.0, 0.0, 10.0),
+            "pos": wp.vec3(0.0, 0.0, 4.0),
             "rot": wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), wp.pi * 0.5),
             "vel": wp.vec3(0.0, 0.0, 0.0),
             "dim_x": self.sim_width,
@@ -146,7 +146,21 @@ class Example:
             )
         else:  # self.solver_type == "vbd"
             self.solver = newton.solvers.SolverVBD(model=self.model, iterations=self.iterations, 
-                                                   particle_enable_self_contact=False)
+                                                   ogc_contact=False, particle_enable_self_contact=True, 
+                                                   particle_self_contact_radius=0.002, particle_self_contact_margin=0.0035,
+                                                   use_al_contact=True, al_mu=1.0, al_Gamma=0.9)
+            # max_diag = float(self.model.soft_contact_ke) * float(self.model.tri_areas.numpy().mean())
+            # al_mu = 0.1 * max_diag 
+            # self.solver = newton.solvers.SolverVBD(
+            #     self.model,
+            #     iterations=self.iterations,
+            #     particle_enable_self_contact=True,
+            #     particle_self_contact_radius=0.002,
+            #     particle_self_contact_margin=0.0035,
+            #     use_al_contact=True,       # AL 활성화
+            #     al_mu=al_mu,                 # μ (0이면 soft_contact_ke 사용)
+            #     al_Gamma=1.0,              # 감쇠 계수 Γ
+            # )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

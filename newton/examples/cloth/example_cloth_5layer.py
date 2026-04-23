@@ -56,7 +56,7 @@ class Example:
         data_collector.record_to_scene("substeps", self.sim_substeps)
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.iterations = 4
+        self.iterations = 16
         # the BVH used by SolverVBD will be rebuilt every self.bvh_rebuild_frames
         # When the simulated object deforms significantly, simply refitting the BVH can lead to deterioration of the BVH's
         # quality, in this case we need to completely rebuild the tree to achieve better query efficiency.
@@ -89,7 +89,7 @@ class Example:
         ], dtype=wp.vec3)  
         for i in range(0,5):
             scene.add_cloth_mesh( # yk: how to add cloth mesh is written here
-                pos=wp.vec3(0.0, 0.0, 1.2+i*0.05),
+                pos=wp.vec3(i*0.03, i*0.03, 1.2+i*0.05),
                 rot=wp.quat_from_axis_angle(wp.vec3(1, 0, 0), wp.pi / 2),
                 scale=0.01,
                 vertices=vertices,
@@ -116,17 +116,29 @@ class Example:
         self.model = scene.finalize()
         self.model.soft_contact_ke = 1.0e3
         self.model.soft_contact_kd = 1.0e-4
-        self.model.soft_contact_mu = 0.2
+        self.model.soft_contact_mu = 0.0
         data_collector.record_to_scene("cloth_friction_mu", self.model.soft_contact_mu)
+
+        # self.solver = newton.solvers.SolverVBD(
+        #     self.model,
+        #     self.iterations,
+        #     # particle_uvs=cloth_mesh.uvs,
+        #     particle_enable_self_contact=True,
+        #     particle_self_contact_radius=0.002,
+        #     particle_self_contact_margin=0.0035, # yk: this handles the entire contact margin. (= query radius)
+        #     coordinate_condensation=True
+        # )
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
-            self.iterations,
-            # particle_uvs=cloth_mesh.uvs,
+            iterations=self.iterations,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
-            particle_self_contact_margin=0.0035, # yk: this handles the entire contact margin. (= query radius)
+            particle_self_contact_margin=0.0035,
+            ogc_contact=True,
             coordinate_condensation=True
+            # use_al_contact=True,       # AL 활성화
+            # al_Gamma=0.9,              # 감쇠 계수 Γ
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

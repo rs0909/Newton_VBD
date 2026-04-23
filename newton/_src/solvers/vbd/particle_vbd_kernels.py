@@ -32,7 +32,13 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import evaluate_body_particle_con
 
 from ...geometry import ParticleFlags
 from ...geometry.kernels import triangle_closest_point
-from .tri_mesh_collision import TriMeshCollisionInfo
+from .tri_mesh_collision import (
+    TriMeshCollisionInfo,
+    get_edge_colliding_edges,
+    get_edge_colliding_edges_count,
+    get_vertex_colliding_triangles,
+    get_vertex_colliding_triangles_count,
+)
 
 # TODO: Grab changes from Warp that has fixed the backward pass
 wp.set_module_options({"enable_backward": False})
@@ -1753,6 +1759,8 @@ def forward_step_penetration_free(
     external_force: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
+    particle_conservative_half_spaces: wp.array(dtype=wp.vec4),
+    particle_conservative_n_half_spaces: wp.array(dtype=wp.int32),
     particle_conservative_bounds: wp.array(dtype=float),
     inertia: wp.array(dtype=wp.vec3),
 ):
@@ -1770,8 +1778,10 @@ def forward_step_penetration_free(
     pos_inertia = pos[particle_index] + vel_new * dt
     inertia[particle_index] = pos_inertia
 
-    pos[particle_index] = apply_conservative_bound_truncation(
-        particle_index, pos_inertia, pos_prev_collision_detection, particle_conservative_bounds
+    pos[particle_index] = apply_anisotropic_conservative_bound(
+        particle_index, pos_inertia, pos_prev_collision_detection,
+        particle_conservative_half_spaces, particle_conservative_n_half_spaces,
+        particle_conservative_bounds,
     )
 
 
@@ -1863,6 +1873,136 @@ def apply_conservative_bound_truncation(
         return particle_pos_prev_collision_detection + accumulated_displacement
     else:
         return pos_new
+
+
+ANISOTROPIC_BOUND_MAX_HALF_SPACES = wp.constant(wp.int32(8))
+
+
+@wp.func
+def apply_anisotropic_conservative_bound(
+    v_index: wp.int32,
+    pos_new: wp.vec3,
+    pos_prev_collision_detection: wp.array(dtype=wp.vec3),
+    half_spaces: wp.array(dtype=wp.vec4),
+    n_half_spaces: wp.array(dtype=wp.int32),
+    particle_conservative_bounds: wp.array(dtype=float),
+):
+    """Anisotropic conservative bound: clips only the normal component of Δx per contact.
+
+    For each stored contact k: n_k^T Δx ≤ d_k  (tangential motion is unconstrained).
+    Scalar fallback (original OGC) is applied afterwards as a safety net.
+    """
+    pos_ref = pos_prev_collision_detection[v_index]
+    delta_x = pos_new - pos_ref
+    base = v_index * ANISOTROPIC_BOUND_MAX_HALF_SPACES
+    n_hs = n_half_spaces[v_index]
+    for k in range(n_hs):
+        hs = half_spaces[base + k]
+        n_k = wp.vec3(hs[0], hs[1], hs[2])
+        # Clamp d_k to 0: if already penetrating, prevent further penetration
+        d_k = wp.max(hs[3], float(0.0))
+        proj = wp.dot(delta_x, n_k)
+        if proj > d_k:
+            delta_x = delta_x - (proj - d_k) * n_k
+
+    # Scalar fallback: always limit total displacement to adjacency-based bound
+    scalar_bound = particle_conservative_bounds[v_index]
+    dlen = wp.length(delta_x)
+    if dlen > scalar_bound and scalar_bound > 1e-5:
+        delta_x = delta_x * (scalar_bound / dlen)
+
+    return pos_ref + delta_x
+
+
+@wp.kernel
+def compute_particle_anisotropic_bound(
+    conservative_bound_relaxation: float,
+    al_mu: float,
+    pos: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    adjacency: ParticleForceElementAdjacencyInfo,
+    edge_edge_parallel_epsilon: float,
+    collision_info: TriMeshCollisionInfo,
+    # outputs
+    half_spaces: wp.array(dtype=wp.vec4),
+    n_half_spaces: wp.array(dtype=wp.int32),
+):
+    """Compute per-vertex half-space conservative bounds from VT and incident-edge EE contacts.
+
+    For each contact k stores (n_k, d_k):
+      n_k  = outward contact normal at detection time
+      d_k  = conservative_bound_relaxation × distance - λ_k / μ  (AL-adjusted when al_mu > 0)
+    As AL multiplier λ_k accumulates (contact force builds up), d_k tightens,
+    preventing further penetration without adding a separate contact force/hessian.
+    """
+    v = wp.tid()
+    v_pos = pos[v]
+    base = v * ANISOTROPIC_BOUND_MAX_HALF_SPACES
+    k = wp.int32(0)
+
+    vt_offset = collision_info.vertex_colliding_triangles_offsets[v]
+
+    # --- VT contacts: vertex v vs triangle ---
+    n_vt = get_vertex_colliding_triangles_count(collision_info, v)
+    for i in range(n_vt):
+        if k >= ANISOTROPIC_BOUND_MAX_HALF_SPACES:
+            break
+        tri_idx = get_vertex_colliding_triangles(collision_info, v, i)
+        if tri_idx < 0:
+            continue
+        ta = tri_indices[tri_idx, 0]
+        tb = tri_indices[tri_idx, 1]
+        tc = tri_indices[tri_idx, 2]
+        closest_pt, _bary, _feat = triangle_closest_point(pos[ta], pos[tb], pos[tc], v_pos)
+        diff = v_pos - closest_pt
+        dis = wp.length(diff)
+        if dis > 1e-8:
+            n_k = diff / dis
+            d_k = conservative_bound_relaxation * dis
+            if al_mu > 0.0:
+                lambda_k = collision_info.vt_al_lambda[vt_offset + i]
+                d_k = d_k - lambda_k / al_mu
+            d_k = wp.max(d_k, float(0.0))
+            half_spaces[base + k] = wp.vec4(n_k[0], n_k[1], n_k[2], d_k)
+            k += 1
+
+    # --- EE contacts: each edge incident on v (vertex_order 2 or 3) ---
+    for i_adj in range(get_vertex_num_adjacent_edges(adjacency, v)):
+        if k >= ANISOTROPIC_BOUND_MAX_HALF_SPACES:
+            break
+        e1_idx, vertex_order = get_vertex_adjacent_edge_id_order(adjacency, v, i_adj)
+        if vertex_order != 2 and vertex_order != 3:
+            continue  # v is not an endpoint of this edge (bending wing vertex)
+        ee_offset = collision_info.edge_colliding_edges_offsets[e1_idx]
+        n_ee = get_edge_colliding_edges_count(collision_info, e1_idx)
+        for j in range(n_ee):
+            if k >= ANISOTROPIC_BOUND_MAX_HALF_SPACES:
+                break
+            e2_idx = get_edge_colliding_edges(collision_info, e1_idx, j)
+            if e2_idx < 0:
+                continue
+            e1_v1 = pos[edge_indices[e1_idx, 2]]
+            e1_v2 = pos[edge_indices[e1_idx, 3]]
+            e2_v1 = pos[edge_indices[e2_idx, 2]]
+            e2_v2 = pos[edge_indices[e2_idx, 3]]
+            st = wp.closest_point_edge_edge(e1_v1, e1_v2, e2_v1, e2_v2, edge_edge_parallel_epsilon)
+            dis = st[2]
+            if dis > 1e-8:
+                s = st[0]
+                c1 = e1_v1 + (e1_v2 - e1_v1) * s
+                c2 = e2_v1 + (e2_v2 - e2_v1) * st[1]
+                diff = c1 - c2
+                n_k = diff / dis
+                d_k = conservative_bound_relaxation * dis
+                if al_mu > 0.0:
+                    lambda_k = collision_info.ee_al_lambda[ee_offset + j]
+                    d_k = d_k - lambda_k / al_mu
+                d_k = wp.max(d_k, float(0.0))
+                half_spaces[base + k] = wp.vec4(n_k[0], n_k[1], n_k[2], d_k)
+                k += 1
+
+    n_half_spaces[v] = k
 
 
 @wp.kernel
@@ -3152,6 +3292,8 @@ def solve_trimesh_with_self_contact_penetration_free(
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
+    particle_conservative_half_spaces: wp.array(dtype=wp.vec4),
+    particle_conservative_n_half_spaces: wp.array(dtype=wp.int32),
     particle_conservative_bounds: wp.array(dtype=float),
     # output
     pos_new: wp.array(dtype=wp.vec3),
@@ -3251,8 +3393,10 @@ def solve_trimesh_with_self_contact_penetration_free(
         h_inv = wp.inverse(h)
         particle_pos_new = pos[particle_index] + h_inv * f
 
-        pos_new[particle_index] = apply_conservative_bound_truncation(
-            particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
+        pos_new[particle_index] = apply_anisotropic_conservative_bound(
+            particle_index, particle_pos_new, pos_prev_collision_detection,
+            particle_conservative_half_spaces, particle_conservative_n_half_spaces,
+            particle_conservative_bounds,
         )
 
 
@@ -3278,6 +3422,8 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
+    particle_conservative_half_spaces: wp.array(dtype=wp.vec4),
+    particle_conservative_n_half_spaces: wp.array(dtype=wp.int32),
     particle_conservative_bounds: wp.array(dtype=float),
     # output
     pos_new: wp.array(dtype=wp.vec3),
@@ -3393,8 +3539,10 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             )
             particle_pos_new = particle_pos + h_inv * f_total
 
-            pos_new[particle_index] = apply_conservative_bound_truncation(
-                particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
+            pos_new[particle_index] = apply_anisotropic_conservative_bound(
+                particle_index, particle_pos_new, pos_prev_collision_detection,
+                particle_conservative_half_spaces, particle_conservative_n_half_spaces,
+                particle_conservative_bounds,
             )
 
 # ===== JGS2 Precomputation =====
