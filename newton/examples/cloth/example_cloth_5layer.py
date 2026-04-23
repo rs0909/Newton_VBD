@@ -89,7 +89,7 @@ class Example:
         ], dtype=wp.vec3)  
         for i in range(0,5):
             scene.add_cloth_mesh( # yk: how to add cloth mesh is written here
-                pos=wp.vec3(0.0, 0.0, 1.2+i*0.05),
+                pos=wp.vec3(i*0.02, i*0.02, 1.2+i*0.05),
                 rot=wp.quat_from_axis_angle(wp.vec3(1, 0, 0), wp.pi / 2),
                 scale=0.01,
                 vertices=vertices,
@@ -126,6 +126,7 @@ class Example:
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
             particle_self_contact_margin=0.0035, # yk: this handles the entire contact margin. (= query radius)
+            ogc_contact = True
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
