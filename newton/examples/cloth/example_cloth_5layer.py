@@ -125,8 +125,11 @@ class Example:
             # particle_uvs=cloth_mesh.uvs,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
-            particle_self_contact_margin=0.0035, # yk: this handles the entire contact margin. (= query radius)
-            ogc_contact = True
+            particle_self_contact_margin=0.0035,
+            ogc_contact=True,
+            coordinate_condensation=True
+            # use_al_contact=True,       # AL 활성화
+            # al_Gamma=0.9,              # 감쇠 계수 Γ
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
