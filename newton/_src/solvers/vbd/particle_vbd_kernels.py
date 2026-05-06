@@ -3153,6 +3153,10 @@ def solve_trimesh_with_self_contact_penetration_free(
     particle_hessians: wp.array(dtype=wp.mat33),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
     particle_conservative_bounds: wp.array(dtype=float),
+    # JGS2 cubature weights (one float per vertex-adjacent-face entry)
+    cubature_face_weights: wp.array(dtype=float),
+    # 0 = JGS2 (augment Hessian), 1 = Coordinate Condensation (deflate)
+    use_coord_condensation: int,
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -3171,6 +3175,11 @@ def solve_trimesh_with_self_contact_penetration_free(
     # inertia force and hessian
     f = mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
     h = mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
+
+    # JGS2 reduced Hessian / force accumulators
+    h_jgs2 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    f_jgs2 = wp.vec3(0.0, 0.0, 0.0)
+    adj_face_weight_base = adjacency.v_adj_faces_offsets[particle_index] >> 1
 
     # fmt: off
     if wp.static("inertia_force_hessian" in VBD_DEBUG_PRINTING_OPTIONS):
@@ -3218,6 +3227,11 @@ def solve_trimesh_with_self_contact_penetration_free(
         f = f + f_tri
         h = h + h_tri
 
+        # JGS2 cubature correction
+        w = cubature_face_weights[adj_face_weight_base + i_adj_tri]
+        h_jgs2 = h_jgs2 + w * h_tri
+        f_jgs2 = f_jgs2 + w * f_tri
+
 
     for i_adj_edge in range(get_vertex_num_adjacent_edges(adjacency, particle_index)):
         nei_edge_index, vertex_order_on_edge = get_vertex_adjacent_edge_id_order(adjacency, particle_index, i_adj_edge)
@@ -3247,9 +3261,19 @@ def solve_trimesh_with_self_contact_penetration_free(
     h = h + particle_hessians[particle_index]
     f = f + particle_forces[particle_index]
 
-    if abs(wp.determinant(h)) > 1e-5:
-        h_inv = wp.inverse(h)
-        particle_pos_new = pos[particle_index] + h_inv * f
+    # JGS2 / CoC: Hessian selection with gradient correction
+    f_final = f + f_jgs2
+    h_base = h
+    h_final = h_base + h_jgs2  # default: JGS2 (augment Hessian)
+    if use_coord_condensation == 1:
+        h_coc = h_base - h_jgs2
+        if abs(wp.determinant(h_coc)) > 1e-5:
+            h_final = h_coc
+        # else: keep JGS2 fallback
+
+    if abs(wp.determinant(h_final)) > 1e-5:
+        h_inv = wp.inverse(h_final)
+        particle_pos_new = pos[particle_index] + h_inv * f_final
 
         pos_new[particle_index] = apply_conservative_bound_truncation(
             particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
@@ -3279,6 +3303,10 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
     particle_hessians: wp.array(dtype=wp.mat33),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
     particle_conservative_bounds: wp.array(dtype=float),
+    # JGS2 cubature weights (one float per vertex-adjacent-face entry)
+    cubature_face_weights: wp.array(dtype=float),
+    # 0 = JGS2 (augment Hessian), 1 = Coordinate Condensation (deflate)
+    use_coord_condensation: int,
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -3299,9 +3327,13 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
 
     # elastic force and hessian
     num_adj_faces = get_vertex_num_adjacent_faces(adjacency, particle_index)
+    adj_face_weight_base = adjacency.v_adj_faces_offsets[particle_index] >> 1
 
     f = wp.vec3(0.0)
     h = wp.mat33(0.0)
+    # JGS2 per-thread accumulators
+    h_jgs2 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    f_jgs2 = wp.vec3(0.0, 0.0, 0.0)
 
     batch_counter = wp.int32(0)
 
@@ -3347,6 +3379,11 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
         f += f_tri
         h += h_tri
 
+        # JGS2 cubature correction
+        w = cubature_face_weights[adj_face_weight_base + adj_tri_counter]
+        h_jgs2 = h_jgs2 + w * h_tri
+        f_jgs2 = f_jgs2 + w * f_tri
+
     batch_counter = wp.int32(0)
     num_adj_edges = get_vertex_num_adjacent_edges(adjacency, particle_index)
     while batch_counter + thread_idx < num_adj_edges:
@@ -3372,26 +3409,39 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             f += f_edge
             h += h_edge
 
-    f_tile = wp.tile(f, preserve_type=True)
-    h_tile = wp.tile(h, preserve_type=True)
+    f_tile  = wp.tile(f,     preserve_type=True)
+    h_tile  = wp.tile(h,     preserve_type=True)
+    fj_tile = wp.tile(f_jgs2, preserve_type=True)
+    hj_tile = wp.tile(h_jgs2, preserve_type=True)
 
-    f_total = wp.tile_reduce(wp.add, f_tile)[0]
-    h_total = wp.tile_reduce(wp.add, h_tile)[0]
+    f_total  = wp.tile_reduce(wp.add, f_tile)[0]
+    h_total  = wp.tile_reduce(wp.add, h_tile)[0]
+    fj_total = wp.tile_reduce(wp.add, fj_tile)[0]
+    hj_total = wp.tile_reduce(wp.add, hj_tile)[0]
 
     if thread_idx == 0:
-        h_total = (
+        h_base = (
             h_total
             + mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
             + particle_hessians[particle_index]
         )
-        if abs(wp.determinant(h_total)) > 1e-5:
-            h_inv = wp.inverse(h_total)
-            f_total = (
-                f_total
-                + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
-                + particle_forces[particle_index]
-            )
-            particle_pos_new = particle_pos + h_inv * f_total
+        f_final = (
+            f_total
+            + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
+            + particle_forces[particle_index]
+            + fj_total
+        )
+        # JGS2 / CoC: branch on Hessian augmentation vs deflation
+        h_final = h_base + hj_total  # default: JGS2
+        if use_coord_condensation == 1:
+            h_coc = h_base - hj_total
+            if abs(wp.determinant(h_coc)) > 1e-5:
+                h_final = h_coc
+            # else: keep JGS2 fallback
+
+        if abs(wp.determinant(h_final)) > 1e-5:
+            h_inv = wp.inverse(h_final)
+            particle_pos_new = particle_pos + h_inv * f_final
 
             pos_new[particle_index] = apply_conservative_bound_truncation(
                 particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds

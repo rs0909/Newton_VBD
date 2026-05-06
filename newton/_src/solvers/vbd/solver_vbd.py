@@ -57,6 +57,14 @@ from .particle_vbd_kernels import (
     solve_trimesh_with_self_contact_penetration_free_tile,
     update_velocity,
 )
+from .recolor_kernels import (
+    WATCHLIST_MAX_PER_VERTEX,
+    accumulate_watchlist_barrier_forces,
+    apply_effective_color_assignments,
+    compute_vertex_aabbs_for_recolor,
+    find_same_color_proximity,
+    reset_proximity_state,
+)
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
     RigidForceElementAdjacencyInfo,
@@ -172,6 +180,9 @@ class SolverVBD(SolverBase):
 
         ogc_contact: bool = False,
         coordinate_condensation: bool = False,
+        # Dynamic recoloring + watchlist barrier (OGC vulnerability mitigation).
+        # Set > 0 to enable; 0.0 (default) disables the feature entirely.
+        watchlist_barrier_stiffness: float = 0.0,
     ):
         """
         Args:
@@ -285,6 +296,7 @@ class SolverVBD(SolverBase):
             particle_rest_shape_contact_exclusion_radius,
             particle_external_vertex_contact_filtering_map,
             particle_external_edge_contact_filtering_map,
+            watchlist_barrier_stiffness=watchlist_barrier_stiffness,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -327,8 +339,16 @@ class SolverVBD(SolverBase):
         particle_rest_shape_contact_exclusion_radius: float,
         particle_external_vertex_contact_filtering_map: dict | None,
         particle_external_edge_contact_filtering_map: dict | None,
+        watchlist_barrier_stiffness: float = 0.0,
     ):
         """Initialize particle-specific data structures and settings."""
+        # Proximity guard defaults (set properly below when particles + self-contact)
+        self._use_proximity_guard = False
+        self._watchlist_barrier_stiffness = watchlist_barrier_stiffness
+        self._n_dynamic_colors: int = 0
+        self._dynamic_color_groups: list = []
+        self._filtered_color_groups: list = []
+
         # Early exit if no particles
         if model.particle_count == 0:
             return
@@ -369,6 +389,11 @@ class SolverVBD(SolverBase):
             self.particle_conservative_bound_relaxation = particle_conservative_bound_relaxation
             self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
             self.particle_conservative_bounds = wp.zeros((model.particle_count,), dtype=float, device=self.device)
+
+            # Proximity guard: watchlist barrier + dynamic recoloring
+            self._use_proximity_guard = watchlist_barrier_stiffness > 0.0
+            if self._use_proximity_guard:
+                self._init_proximity_state()
 
             self.trimesh_collision_detector = TriMeshCollisionDetector(
                 self.model,
@@ -1009,6 +1034,10 @@ class SolverVBD(SolverBase):
             else:
                 self.collision_detection_penetration_free_log_collision(state_in, -1)
 
+            # Build watchlist + dynamic recolor groups from fresh OGC bounds
+            if self._use_proximity_guard:
+                self._update_proximity_state()
+
             wp.launch(
                 kernel=forward_step_penetration_free,
                 inputs=[
@@ -1463,152 +1492,250 @@ class SolverVBD(SolverBase):
                 )
             
 
-            # Solve for this color group
-            if self.particle_enable_self_contact:
+            # Watchlist barrier: repel same-color proximity pairs.
+            # Uses state_in.particle_q (updated each color via copy_particle_positions_back)
+            # so forces reflect the current Gauss-Seidel state, not stale substep-start.
+            if self._use_proximity_guard:
+                _barrier_group = (
+                    self._filtered_color_groups[color]
+                    if self._filtered_color_groups[color] is not None
+                    else model.particle_color_groups[color]
+                )
+                if _barrier_group is not None and _barrier_group.size > 0:
+                    wp.launch(
+                        kernel=accumulate_watchlist_barrier_forces,
+                        dim=_barrier_group.size,
+                        inputs=[
+                            _barrier_group,
+                            state_in.particle_q,
+                            model.particle_mass,
+                            self._watchlist_partners,
+                            self._watchlist_count,
+                            self.particle_conservative_bounds,
+                            self._watchlist_barrier_stiffness,
+                        ],
+                        outputs=[self.particle_forces, self.particle_hessians],
+                        device=self.device,
+                    )
+
+            # Effective color group for solve: filtered (conflict vertices removed) when
+            # proximity guard is active; otherwise the full original group.
+            _solve_group = (
+                self._filtered_color_groups[color]
+                if self._use_proximity_guard
+                else model.particle_color_groups[color]
+            )
+
+            # Solve for this color group (skip if filtered group is empty)
+            if _solve_group is not None and _solve_group.size > 0:
+                if self.particle_enable_self_contact:
+                    if self.use_particle_tile_solve:
+                        wp.launch(
+                            kernel=solve_trimesh_with_self_contact_penetration_free_tile,
+                            dim=_solve_group.size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+                            block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+                            inputs=[
+                                dt,
+                                _solve_group,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                model.particle_mass,
+                                self.inertia,
+                                model.particle_flags,
+                                model.tri_indices,
+                                model.tri_poses,
+                                model.tri_materials,
+                                model.tri_areas,
+                                model.edge_indices,
+                                model.edge_rest_angle,
+                                model.edge_rest_length,
+                                model.edge_bending_properties,
+                                self.particle_adjacency,
+                                self.particle_forces,
+                                self.particle_hessians,
+                                self.pos_prev_collision_detection,
+                                self.particle_conservative_bounds,
+                                self.cubature_face_weights,
+                                self.use_coord_condensation,
+                            ],
+                            outputs=[state_out.particle_q, self.stvk_forces],
+                            device=self.device,
+                        )
+                    else:
+                        wp.launch(
+                            kernel=solve_trimesh_with_self_contact_penetration_free,
+                            dim=_solve_group.size,
+                            inputs=[
+                                dt,
+                                _solve_group,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                model.particle_mass,
+                                self.inertia,
+                                model.particle_flags,
+                                model.tri_indices,
+                                model.tri_poses,
+                                model.tri_materials,
+                                model.tri_areas,
+                                model.edge_indices,
+                                model.edge_rest_angle,
+                                model.edge_rest_length,
+                                model.edge_bending_properties,
+                                self.particle_adjacency,
+                                self.particle_forces,
+                                self.particle_hessians,
+                                self.pos_prev_collision_detection,
+                                self.particle_conservative_bounds,
+                                self.cubature_face_weights,
+                                self.use_coord_condensation,
+                            ],
+                            outputs=[state_out.particle_q, self.stvk_forces],
+                            device=self.device,
+                        )
+                else:
+                    if self.use_particle_tile_solve:
+                        wp.launch(
+                            kernel=solve_trimesh_no_self_contact_tile,
+                            inputs=[
+                                dt,
+                                _solve_group,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                model.particle_mass,
+                                self.inertia,
+                                model.particle_flags,
+                                model.tri_indices,
+                                model.tri_poses,
+                                model.tri_materials,
+                                model.tri_areas,
+                                model.edge_indices,
+                                model.edge_rest_angle,
+                                model.edge_rest_length,
+                                model.edge_bending_properties,
+                                self.particle_adjacency,
+                                self.particle_forces,
+                                self.particle_hessians,
+                                self.cubature_face_weights,
+                                self.use_coord_condensation,
+                            ],
+                            outputs=[state_out.particle_q, self.stvk_forces],
+                            dim=_solve_group.size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+                            block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+                            device=self.device,
+                        )
+                    else:
+                        wp.launch(
+                            kernel=solve_trimesh_no_self_contact,
+                            inputs=[
+                                dt,
+                                _solve_group,
+                                self.particle_q_prev,
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                model.particle_mass,
+                                self.inertia,
+                                model.particle_flags,
+                                model.tri_indices,
+                                model.tri_poses,
+                                model.tri_materials,
+                                model.tri_areas,
+                                model.edge_indices,
+                                model.edge_rest_angle,
+                                model.edge_rest_length,
+                                model.edge_bending_properties,
+                                self.particle_adjacency,
+                                self.particle_forces,
+                                self.particle_hessians,
+                                self.cubature_face_weights,
+                                self.use_coord_condensation,
+                            ],
+                            outputs=[state_out.particle_q, self.stvk_forces],
+                            dim=_solve_group.size,
+                            device=self.device,
+                        )
+
+                # Copy solved positions back for Gauss-Seidel ordering
+                wp.launch(
+                    kernel=copy_particle_positions_back,
+                    inputs=[_solve_group, state_in.particle_q, state_out.particle_q],
+                    dim=_solve_group.size,
+                    device=self.device,
+                )
+        # end color loop
+
+        # Dynamic color groups: recolored vertices solved sequentially after all original
+        # colors.  Contact forces were already accumulated during the original color pass
+        # (accumulate kernels use model.particle_colors, which matches the original color);
+        # barrier forces are added here from the latest Gauss-Seidel positions.
+        if self._use_proximity_guard and self._n_dynamic_colors > 0:
+            for dyn_group in self._dynamic_color_groups:
+                if dyn_group.size == 0:
+                    continue
+
+                # Barrier for this dynamic group (current GS positions)
+                wp.launch(
+                    kernel=accumulate_watchlist_barrier_forces,
+                    dim=dyn_group.size,
+                    inputs=[
+                        dyn_group,
+                        state_in.particle_q,
+                        model.particle_mass,
+                        self._watchlist_partners,
+                        self._watchlist_count,
+                        self.particle_conservative_bounds,
+                        self._watchlist_barrier_stiffness,
+                    ],
+                    outputs=[self.particle_forces, self.particle_hessians],
+                    device=self.device,
+                )
+
                 if self.use_particle_tile_solve:
                     wp.launch(
                         kernel=solve_trimesh_with_self_contact_penetration_free_tile,
-                        dim=model.particle_color_groups[color].size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+                        dim=dyn_group.size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
                         block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
                         inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                            self.pos_prev_collision_detection,
-                            self.particle_conservative_bounds,
+                            dt, dyn_group,
+                            self.particle_q_prev, state_in.particle_q, state_in.particle_qd,
+                            model.particle_mass, self.inertia, model.particle_flags,
+                            model.tri_indices, model.tri_poses, model.tri_materials, model.tri_areas,
+                            model.edge_indices, model.edge_rest_angle, model.edge_rest_length,
+                            model.edge_bending_properties, self.particle_adjacency,
+                            self.particle_forces, self.particle_hessians,
+                            self.pos_prev_collision_detection, self.particle_conservative_bounds,
+                            self.cubature_face_weights, self.use_coord_condensation,
                         ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces
-                        ],
+                        outputs=[state_out.particle_q, self.stvk_forces],
                         device=self.device,
                     )
                 else:
                     wp.launch(
                         kernel=solve_trimesh_with_self_contact_penetration_free,
-                        dim=model.particle_color_groups[color].size,
+                        dim=dyn_group.size,
                         inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                            self.pos_prev_collision_detection,
-                            self.particle_conservative_bounds,
+                            dt, dyn_group,
+                            self.particle_q_prev, state_in.particle_q, state_in.particle_qd,
+                            model.particle_mass, self.inertia, model.particle_flags,
+                            model.tri_indices, model.tri_poses, model.tri_materials, model.tri_areas,
+                            model.edge_indices, model.edge_rest_angle, model.edge_rest_length,
+                            model.edge_bending_properties, self.particle_adjacency,
+                            self.particle_forces, self.particle_hessians,
+                            self.pos_prev_collision_detection, self.particle_conservative_bounds,
+                            self.cubature_face_weights, self.use_coord_condensation,
                         ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces    
-                        ],
-                        device=self.device,
-                    )
-            else:
-                if self.use_particle_tile_solve:
-                    wp.launch(
-                        kernel=solve_trimesh_no_self_contact_tile,
-                        inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                            self.cubature_face_weights,
-                            self.use_coord_condensation,
-                        ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces
-                        ],
-                        dim=model.particle_color_groups[color].size * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                        block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                        device=self.device,
-                    )
-                else:
-                    wp.launch(
-                        kernel=solve_trimesh_no_self_contact,
-                        inputs=[
-                            dt,
-                            model.particle_color_groups[color],
-                            self.particle_q_prev,
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            model.particle_mass,
-                            self.inertia,
-                            model.particle_flags,
-                            model.tri_indices,
-                            model.tri_poses,
-                            model.tri_materials,
-                            model.tri_areas,
-                            model.edge_indices,
-                            model.edge_rest_angle,
-                            model.edge_rest_length,
-                            model.edge_bending_properties,
-                            self.particle_adjacency,
-                            self.particle_forces,
-                            self.particle_hessians,
-                            self.cubature_face_weights,
-                            self.use_coord_condensation,
-                        ],
-                        outputs=[
-                            state_out.particle_q,
-                            self.stvk_forces
-                        ],
-                        dim=model.particle_color_groups[color].size,
+                        outputs=[state_out.particle_q, self.stvk_forces],
                         device=self.device,
                     )
 
-            # Copy positions back
-            wp.launch(
-                kernel=copy_particle_positions_back,
-                inputs=[model.particle_color_groups[color], state_in.particle_q, state_out.particle_q],
-                dim=model.particle_color_groups[color].size,
-                device=self.device,
-            )
-        # end color loop
+                wp.launch(
+                    kernel=copy_particle_positions_back,
+                    inputs=[dyn_group, state_in.particle_q, state_out.particle_q],
+                    dim=dyn_group.size,
+                    device=self.device,
+                )
         if not data_collector.is_log_nothing():
             data_collector.frame_timer.stop()
             total_force = (self.particle_forces + self.stvk_forces).numpy().reshape(-1, 3)
@@ -1971,6 +2098,198 @@ class SolverVBD(SolverBase):
                     self.joint_dkappa_prev,  # input/output
                 ],
                 dim=model.joint_count,
+                device=self.device,
+            )
+
+    # -------------------------------------------------------------------------
+    # Proximity guard: watchlist barrier + dynamic recoloring
+    # -------------------------------------------------------------------------
+
+    def _init_proximity_state(self):
+        """Allocate GPU arrays and vertex BVH for same-color proximity detection."""
+        model = self.model
+        pc = model.particle_count
+        wl = int(WATCHLIST_MAX_PER_VERTEX)
+
+        # Vertex BVH: one AABB leaf per vertex with radius 2*r_OGC
+        self._vx_aabb_lower = wp.zeros(pc, dtype=wp.vec3, device=self.device)
+        self._vx_aabb_upper = wp.zeros(pc, dtype=wp.vec3, device=self.device)
+        self._bvh_vertices = wp.Bvh(self._vx_aabb_lower, self._vx_aabb_upper)
+
+        # Watchlist: per-vertex list of same-color proximity partners
+        self._watchlist_partners = wp.zeros(pc * wl, dtype=wp.int32, device=self.device)
+        self._watchlist_count = wp.zeros(pc, dtype=wp.int32, device=self.device)
+
+        # Recolor flags: > 0 means the vertex must be solved in a dynamic color group
+        self._recolor_flags = wp.zeros(pc, dtype=wp.int32, device=self.device)
+
+        # Effective color: original color by default; overridden for recolored vertices
+        self._particle_effective_color = wp.clone(model.particle_colors)
+
+        # CPU cache of original color groups — avoids GPU→CPU copies every substep
+        self._color_groups_cpu = [g.numpy().astype(np.int32) for g in model.particle_color_groups]
+
+        # Filtered original color groups (recolored vertices removed); default = full groups
+        self._filtered_color_groups: list[wp.array | None] = list(model.particle_color_groups)
+
+        # Dynamic color groups for recolored vertices (rebuilt each substep on CPU)
+        self._dynamic_color_groups: list[wp.array] = []
+        self._n_dynamic_colors: int = 0
+
+    def _update_proximity_state(self):
+        """Rebuild watchlist + dynamic color groups from the freshly computed OGC bounds.
+
+        Called once per substep immediately after collision_detection_penetration_free
+        so that particle_conservative_bounds and pos_prev_collision_detection are current.
+        """
+        model = self.model
+
+        # 1. Update vertex BVH bounds (AABB radius = 2 * r_OGC per vertex)
+        wp.launch(
+            kernel=compute_vertex_aabbs_for_recolor,
+            dim=model.particle_count,
+            inputs=[self.pos_prev_collision_detection, self.particle_conservative_bounds],
+            outputs=[self._vx_aabb_lower, self._vx_aabb_upper],
+            device=self.device,
+        )
+        self._bvh_vertices.refit()
+
+        # 2. Reset watchlist and recolor state
+        wp.launch(
+            kernel=reset_proximity_state,
+            dim=model.particle_count,
+            inputs=[self._watchlist_count, self._recolor_flags],
+            device=self.device,
+        )
+
+        # 3. Find same-color proximity pairs (populates watchlist + recolor_flags)
+        wp.launch(
+            kernel=find_same_color_proximity,
+            dim=model.particle_count,
+            inputs=[
+                self.pos_prev_collision_detection,
+                model.particle_colors,
+                self.particle_conservative_bounds,
+                self._bvh_vertices.id,
+            ],
+            outputs=[self._recolor_flags, self._watchlist_partners, self._watchlist_count],
+            device=self.device,
+        )
+
+        # 4. CPU-side greedy coloring → filtered + dynamic color group arrays
+        self._rebuild_dynamic_color_groups()
+
+    def _rebuild_dynamic_color_groups(self):
+        """Greedy-color conflict vertices into dynamic groups for sequential solve.
+
+        Reads recolor_flags from GPU (one small copy per substep), builds a conflict
+        graph from the watchlist, graph-colors it with a greedy algorithm, and pushes
+        the result back to GPU as wp.array lists.
+
+        After this call:
+            _filtered_color_groups:   Original groups minus recolored vertices.
+            _dynamic_color_groups:    New groups; vertices in each are solved in sequence.
+            _n_dynamic_colors:        Number of dynamic groups this substep.
+            _particle_effective_color: Updated for recolored vertices.
+        """
+        model = self.model
+        n_original = len(model.particle_color_groups)
+
+        # GPU → CPU sync and new GPU allocations below are incompatible with CUDA graph
+        # capture (error 906 / 901 if attempted inside wp.ScopedCapture).
+        # Detect capture mode before issuing any CUDA operation that would corrupt the
+        # stream.  When capturing, skip CPU-side recoloring entirely:
+        #   - GPU arrays (_watchlist_partners, _watchlist_count) are updated by the GPU
+        #     kernel find_same_color_proximity on every graph replay, so the watchlist
+        #     barrier continues to work correctly.
+        #   - Dynamic color groups retain their last pre-capture values (safe, as graph
+        #     capture typically starts after at least one normal step).
+        if wp.get_device(self.device).is_capturing:
+            return
+
+        # GPU → CPU: only the small flag array
+        flags_np = self._recolor_flags.numpy()
+        conflict_vertices = np.where(flags_np > 0)[0].astype(np.int32)
+
+        if len(conflict_vertices) == 0:
+            # Fast path: no conflicts
+            self._filtered_color_groups = list(model.particle_color_groups)
+            self._dynamic_color_groups = []
+            self._n_dynamic_colors = 0
+            wp.copy(self._particle_effective_color, model.particle_colors)
+            return
+
+        conflict_set = set(conflict_vertices.tolist())
+
+        # Build conflict-pair adjacency from the watchlist.
+        # Using all watchlist edges is conservative but correct: it prevents any two
+        # watchlist-adjacent conflict vertices from being solved simultaneously.
+        wl_partners_np = self._watchlist_partners.numpy()
+        wl_count_np = self._watchlist_count.numpy()
+        wl_max = int(WATCHLIST_MAX_PER_VERTEX)
+
+        conflict_adj: dict[int, list[int]] = {int(v): [] for v in conflict_vertices}
+        for vi in conflict_vertices:
+            vi_int = int(vi)
+            n = min(int(wl_count_np[vi_int]), wl_max)
+            for k in range(n):
+                vj = int(wl_partners_np[vi_int * wl_max + k])
+                if vj in conflict_set:
+                    conflict_adj[vi_int].append(vj)
+
+        # Greedy graph coloring of conflict vertices.
+        # Conflict vertices are never mesh-adjacent (original graph coloring guarantees
+        # different colors for mesh-adjacent pairs), so the only coloring constraint is
+        # the conflict-pair edges built above.
+        dynamic_color_of: dict[int, int] = {}
+        for vi in sorted(conflict_adj):
+            used: set[int] = set()
+            for vj in conflict_adj[vi]:
+                if vj in dynamic_color_of:
+                    used.add(dynamic_color_of[vj])
+            c = 0
+            while c in used:
+                c += 1
+            dynamic_color_of[vi] = c
+
+        n_dyn = (max(dynamic_color_of.values()) + 1) if dynamic_color_of else 0
+
+        # Build dynamic color group GPU arrays
+        dyn_buckets: dict[int, list[int]] = {c: [] for c in range(n_dyn)}
+        for vi, c in dynamic_color_of.items():
+            dyn_buckets[c].append(vi)
+
+        self._dynamic_color_groups = [
+            wp.array(np.array(sorted(dyn_buckets[c]), dtype=np.int32), dtype=wp.int32, device=self.device)
+            for c in range(n_dyn)
+        ]
+        self._n_dynamic_colors = n_dyn
+
+        # Build filtered original color groups (conflict vertices removed)
+        self._filtered_color_groups = []
+        for group_np in self._color_groups_cpu:
+            mask = ~np.isin(group_np, conflict_vertices)
+            filtered = group_np[mask]
+            self._filtered_color_groups.append(
+                wp.array(filtered, dtype=wp.int32, device=self.device) if len(filtered) > 0 else None
+            )
+
+        # Update effective colors on GPU
+        wp.copy(self._particle_effective_color, model.particle_colors)
+        sorted_recolored = sorted(dynamic_color_of.keys())
+        if sorted_recolored:
+            wp.launch(
+                kernel=apply_effective_color_assignments,
+                dim=len(sorted_recolored),
+                inputs=[
+                    wp.array(np.array(sorted_recolored, dtype=np.int32), dtype=wp.int32, device=self.device),
+                    wp.array(
+                        np.array([dynamic_color_of[v] + n_original for v in sorted_recolored], dtype=np.int32),
+                        dtype=wp.int32,
+                        device=self.device,
+                    ),
+                ],
+                outputs=[self._particle_effective_color],
                 device=self.device,
             )
 
