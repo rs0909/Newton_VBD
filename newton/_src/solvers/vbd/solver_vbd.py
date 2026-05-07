@@ -170,6 +170,7 @@ class SolverVBD(SolverBase):
         rigid_dahl_tau: float | wp.array = 1.0,  # Dahl: memory decay length
 
         ogc_contact: bool = False,
+        diagnostic_same_color_pairs: bool = False,
     ):
         """
         Args:
@@ -246,6 +247,10 @@ class SolverVBD(SolverBase):
               Setting them too small may result in undetected collisions (particles) or contact overflow (rigid body
               contacts).
               Setting them excessively large may increase memory usage and degrade performance.
+            diagnostic_same_color_pairs: When True, prints a per-substep summary of same-color vertex pairs
+                found in the existing OGC collision buffers. Reports candidate count, pairs within R_recolor,
+                pairs within R_watchlist, and minimum same-color distance. Has no effect on solver behavior.
+                Requires particle_enable_self_contact=True (OGC bounds must be available).
 
         """
         super().__init__(model)
@@ -255,6 +260,13 @@ class SolverVBD(SolverBase):
             print()
             print(">>> OGC Contact mode ON <<<")
             print()
+
+        self.diagnostic_same_color_pairs = diagnostic_same_color_pairs
+        if diagnostic_same_color_pairs and not particle_enable_self_contact:
+            print(
+                "[same-color diag] WARNING: diagnostic_same_color_pairs=True has no effect "
+                "without particle_enable_self_contact=True (OGC bounds are not computed)."
+            )
 
         # Common parameters
         self.iterations = iterations
@@ -986,6 +998,9 @@ class SolverVBD(SolverBase):
                 self.collision_detection_penetration_free(state_in, -1)
             else:
                 self.collision_detection_penetration_free_log_collision(state_in, -1)
+
+            if self.diagnostic_same_color_pairs:
+                self._diagnose_same_color_pairs(state_in)
 
             wp.launch(
                 kernel=forward_step_penetration_free,
@@ -2034,3 +2049,91 @@ class SolverVBD(SolverBase):
         """
         if self.particle_enable_self_contact:
             self.trimesh_collision_detector.rebuild(state.particle_q)
+
+    def _diagnose_same_color_pairs(self, current_state: State) -> None:
+        """CPU-side diagnostic: count same-color vertex pairs using existing OGC collision buffers.
+
+        Categorizes same-color proximate pairs into recolor / watchlist / ignore regions
+        using the OGC per-vertex conservative bound as r_recolor:
+
+            R_recolor(i, j)   = r_recolor[i] + r_recolor[j]
+            R_watchlist(i, j) = 2 * r_recolor[i] + 2 * r_recolor[j]
+
+        Source of r_recolor: self.particle_conservative_bounds (already computed by
+        compute_particle_conservative_bound before this call).
+
+        Limitation: requires particle_enable_self_contact=True. If False, OGC bounds are
+        not computed and R_recolor/R_watchlist cannot be derived; a warning is printed and
+        the method returns immediately without a fallback formula.
+
+        Does not modify any solver state. Runs on CPU; intended for debugging only.
+        """
+        if not self.particle_enable_self_contact:
+            print(
+                "[same-color diag] WARNING: particle_enable_self_contact=False. "
+                "OGC bounds (particle_conservative_bounds) are not computed. "
+                "Cannot evaluate R_recolor / R_watchlist. Skipping."
+            )
+            return
+
+        # --- Download GPU data to CPU numpy ---
+        particle_q = current_state.particle_q.numpy()          # (N, 3)
+        particle_colors = self.model.particle_colors.numpy()   # (N,)  int
+        r_recolor = self.particle_conservative_bounds.numpy()  # (N,)  float  = relaxation * min_dist
+        tri_indices = self.model.tri_indices.numpy()           # (T, 3) int
+
+        detector = self.trimesh_collision_detector
+        vt_count = detector.vertex_colliding_triangles_count.numpy()        # (N,)
+        vt_buf_sizes = detector.vertex_colliding_triangles_buffer_sizes.numpy()  # (N,)
+        vt_offsets = detector.vertex_colliding_triangles_offsets.numpy()    # (N+1,)
+        vt_data = detector.vertex_colliding_triangles.numpy()               # flat int32
+
+        n_candidate = 0
+        n_recolor = 0
+        n_watchlist = 0
+        min_same_color_dist = float("inf")
+        seen: set[tuple[int, int]] = set()
+
+        for i in range(self.model.particle_count):
+            color_i = int(particle_colors[i])
+            r_i = float(r_recolor[i])
+            # cap at the actual buffer size to skip overflow slots
+            count_i = int(min(vt_count[i], vt_buf_sizes[i]))
+            off_i = int(vt_offsets[i])
+
+            for k in range(count_i):
+                tri_idx = int(vt_data[2 * (off_i + k) + 1])
+                if tri_idx < 0:
+                    continue
+                # walk the three vertices of the colliding triangle
+                for v_order in range(3):
+                    j = int(tri_indices[tri_idx, v_order])
+                    if j <= i:  # canonical order: only consider (i < j) pairs
+                        continue
+                    if int(particle_colors[j]) != color_i:
+                        continue
+                    pair = (i, j)
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+
+                    d = float(np.linalg.norm(particle_q[i] - particle_q[j]))
+                    r_j = float(r_recolor[j])
+                    R_recolor_ij = r_i + r_j
+                    R_watchlist_ij = 2.0 * r_i + 2.0 * r_j
+
+                    n_candidate += 1
+                    if d < min_same_color_dist:
+                        min_same_color_dist = d
+                    if d <= R_recolor_ij:
+                        n_recolor += 1
+                    elif d <= R_watchlist_ij:
+                        n_watchlist += 1
+
+        min_dist_str = f"{min_same_color_dist:.6f}" if n_candidate > 0 else "N/A"
+        print(
+            f"[same-color diag] candidate={n_candidate} "
+            f"recolor={n_recolor} "
+            f"watchlist={n_watchlist} "
+            f"min_dist={min_dist_str}"
+        )
