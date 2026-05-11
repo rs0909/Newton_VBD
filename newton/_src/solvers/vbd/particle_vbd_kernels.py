@@ -3287,3 +3287,67 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             pos_new[particle_index] = apply_conservative_bound_truncation(
                 particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
             )
+
+
+@wp.kernel
+def build_same_color_watchlist_kernel(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_conservative_bounds: wp.array(dtype=float),
+    particle_colors: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_info: TriMeshCollisionInfo,
+    max_pairs: int,
+    # outputs
+    watchlist_pairs: wp.array(dtype=wp.int32),
+    watchlist_count: wp.array(dtype=wp.int32),
+    recolor_count: wp.array(dtype=wp.int32),
+):
+    """Populate GPU watchlist of same-color vertex pairs from existing OGC collision buffers.
+
+    One thread per vertex i. Walks vertex_colliding_triangles for vertex i and checks each
+    triangle vertex j (j > i, same color) against R_recolor and R_watchlist.
+
+    R_recolor(i,j)   = r[i] + r[j]
+    R_watchlist(i,j) = 2*r[i] + 2*r[j]
+
+    Pairs in the watchlist region (R_recolor < d <= R_watchlist) are written atomically
+    to the flat watchlist_pairs buffer. Pairs in the recolor region (d <= R_recolor) are
+    counted in recolor_count for diagnostics only.
+
+    Note: duplicate pairs from multiple shared triangles are possible and not deduplicated.
+    Pairs beyond max_pairs are silently dropped (caller checks watchlist_count vs max_pairs).
+    """
+    i = wp.tid()
+    color_i = particle_colors[i]
+    r_i = particle_conservative_bounds[i]
+    pos_i = particle_q[i]
+
+    count_i = wp.min(
+        collision_info.vertex_colliding_triangles_count[i],
+        collision_info.vertex_colliding_triangles_buffer_sizes[i],
+    )
+    off_i = collision_info.vertex_colliding_triangles_offsets[i]
+
+    for k in range(count_i):
+        tri_idx = collision_info.vertex_colliding_triangles[2 * (off_i + k) + 1]
+        if tri_idx < 0:
+            continue
+        for v_order in range(3):
+            j = tri_indices[tri_idx, v_order]
+            if j <= i:
+                continue
+            if particle_colors[j] != color_i:
+                continue
+
+            r_j = particle_conservative_bounds[j]
+            d = wp.length(particle_q[j] - pos_i)
+            R_recolor_ij = r_i + r_j
+            R_watchlist_ij = 2.0 * r_i + 2.0 * r_j
+
+            if d <= R_recolor_ij:
+                wp.atomic_add(recolor_count, 0, 1)
+            elif d <= R_watchlist_ij:
+                idx = wp.atomic_add(watchlist_count, 0, 1)
+                if idx < max_pairs:
+                    watchlist_pairs[2 * idx] = wp.int32(i)
+                    watchlist_pairs[2 * idx + 1] = wp.int32(j)

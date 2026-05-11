@@ -38,6 +38,7 @@ from .particle_vbd_kernels import (
     accumulate_spring_force_and_hessian,
     build_edge_n_ring_edge_collision_filter,
     build_vertex_n_ring_tris_collision_filter,
+    build_same_color_watchlist_kernel,
     compute_particle_conservative_bound,
     copy_particle_positions_back,
     # Adjacency building kernels
@@ -171,6 +172,9 @@ class SolverVBD(SolverBase):
 
         ogc_contact: bool = False,
         diagnostic_same_color_pairs: bool = False,
+        # Watchlist parameters (Stage 3)
+        enable_watchlist: bool = False,
+        watchlist_buffer_multiplier: int = 4,
     ):
         """
         Args:
@@ -251,6 +255,15 @@ class SolverVBD(SolverBase):
                 found in the existing OGC collision buffers. Reports candidate count, pairs within R_recolor,
                 pairs within R_watchlist, and minimum same-color distance. Has no effect on solver behavior.
                 Requires particle_enable_self_contact=True (OGC bounds must be available).
+            enable_watchlist: When True, builds a GPU-resident flat buffer of same-color vertex pairs in the
+                watchlist region (R_recolor < d <= R_watchlist) after each OGC bound computation.
+                Pairs in the recolor region (d <= R_recolor) are counted separately for diagnostics.
+                Does not change solver behavior. Requires particle_enable_self_contact=True.
+                This buffer is the foundation for the Stage 5 same-color barrier.
+            watchlist_buffer_multiplier: Pre-allocation scale for the watchlist pair buffer.
+                Buffer capacity = watchlist_buffer_multiplier * particle_count pairs.
+                If the actual pair count exceeds capacity, excess pairs are silently dropped
+                and a warning is printed. Increase this value if overflow warnings appear.
 
         """
         super().__init__(model)
@@ -265,6 +278,13 @@ class SolverVBD(SolverBase):
         if diagnostic_same_color_pairs and not particle_enable_self_contact:
             print(
                 "[same-color diag] WARNING: diagnostic_same_color_pairs=True has no effect "
+                "without particle_enable_self_contact=True (OGC bounds are not computed)."
+            )
+
+        self.enable_watchlist = enable_watchlist
+        if enable_watchlist and not particle_enable_self_contact:
+            print(
+                "[watchlist] WARNING: enable_watchlist=True has no effect "
                 "without particle_enable_self_contact=True (OGC bounds are not computed)."
             )
 
@@ -294,6 +314,8 @@ class SolverVBD(SolverBase):
             particle_rest_shape_contact_exclusion_radius,
             particle_external_vertex_contact_filtering_map,
             particle_external_edge_contact_filtering_map,
+            enable_watchlist,
+            watchlist_buffer_multiplier,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -336,6 +358,8 @@ class SolverVBD(SolverBase):
         particle_rest_shape_contact_exclusion_radius: float,
         particle_external_vertex_contact_filtering_map: dict | None,
         particle_external_edge_contact_filtering_map: dict | None,
+        enable_watchlist: bool = False,
+        watchlist_buffer_multiplier: int = 4,
     ):
         """Initialize particle-specific data structures and settings."""
         # Early exit if no particles
@@ -454,6 +478,18 @@ class SolverVBD(SolverBase):
             self.contacts_friction3 = wp.empty(self.all_collision_count, dtype=wp.vec3, device=self.device)
             self.contacts_v_list = wp.empty(self.all_collision_count, dtype=wp.vec4i, device=self.device)
             self.contacts_mu = wp.empty(self.all_collision_count, dtype=float, device=self.device)
+
+        # Watchlist buffers (Stage 3): GPU-resident same-color pair list
+        # Populated by build_same_color_watchlist_kernel after each OGC bound computation.
+        # Only allocated when both enable_watchlist and particle_enable_self_contact are True.
+        if enable_watchlist and particle_enable_self_contact:
+            max_pairs = watchlist_buffer_multiplier * model.particle_count
+            self.same_color_watchlist_pairs = wp.zeros(
+                2 * max_pairs, dtype=wp.int32, device=self.device
+            )
+            self.same_color_watchlist_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self.same_color_recolor_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self.same_color_watchlist_max_pairs = max_pairs
 
         # Validation
         if len(self.model.particle_color_groups) == 0:
@@ -2005,7 +2041,10 @@ class SolverVBD(SolverBase):
             device=self.device,
         )
 
-    
+        if self.enable_watchlist:
+            self._run_watchlist_kernel(current_state)
+
+
     # called on init(1 time) and solve(iteration times)
     def collision_detection_penetration_free_log_collision(self, current_state: State, iter_num=-2):
         self.trimesh_collision_detector.refit(current_state.particle_q)
@@ -2038,6 +2077,9 @@ class SolverVBD(SolverBase):
             device=self.device,
         )
 
+        if self.enable_watchlist:
+            self._run_watchlist_kernel(current_state)
+
     def rebuild_bvh(self, state: State):
         """This function will rebuild the BVHs used for detecting self-contacts using the input `state`.
 
@@ -2049,6 +2091,45 @@ class SolverVBD(SolverBase):
         """
         if self.particle_enable_self_contact:
             self.trimesh_collision_detector.rebuild(state.particle_q)
+
+    def _run_watchlist_kernel(self, current_state: State) -> None:
+        """Zero watchlist counters, launch build_same_color_watchlist_kernel, print diagnostics.
+
+        Called after compute_particle_conservative_bound whenever enable_watchlist=True.
+        self.same_color_watchlist_pairs is populated with (i, j) pairs in the watchlist region.
+        self.same_color_recolor_count counts pairs in the recolor region (diagnostic only).
+        """
+        self.same_color_watchlist_count.zero_()
+        self.same_color_recolor_count.zero_()
+
+        wp.launch(
+            kernel=build_same_color_watchlist_kernel,
+            inputs=[
+                current_state.particle_q,
+                self.particle_conservative_bounds,
+                self.model.particle_colors,
+                self.model.tri_indices,
+                self.trimesh_collision_detector.collision_info,
+                self.same_color_watchlist_max_pairs,
+            ],
+            outputs=[
+                self.same_color_watchlist_pairs,
+                self.same_color_watchlist_count,
+                self.same_color_recolor_count,
+            ],
+            dim=self.model.particle_count,
+            device=self.device,
+        )
+
+        wl = int(self.same_color_watchlist_count.numpy()[0])
+        rc = int(self.same_color_recolor_count.numpy()[0])
+        overflow = wl > self.same_color_watchlist_max_pairs
+        overflow_str = " OVERFLOW" if overflow else ""
+        print(
+            f"[watchlist] recolor={rc} "
+            f"watchlist={min(wl, self.same_color_watchlist_max_pairs)}/{self.same_color_watchlist_max_pairs}"
+            f"{overflow_str}"
+        )
 
     def _diagnose_same_color_pairs(self, current_state: State) -> None:
         """CPU-side diagnostic: count same-color vertex pairs using existing OGC collision buffers.
