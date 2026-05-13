@@ -3450,3 +3450,88 @@ def accumulate_same_color_watchlist_barrier_kernel(
     if particle_flags[j] & ParticleFlags.ACTIVE:
         wp.atomic_add(particle_forces, j, alpha_j * (-f_barrier))
         wp.atomic_add(particle_hessians, j, alpha_j * H_barrier)
+
+
+@wp.kernel
+def apply_locked_vertex_recovery_kernel(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_conservative_bounds: wp.array(dtype=float),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    collision_info: TriMeshCollisionInfo,
+    alpha: float,
+    epsilon: float,
+    contact_radius: float,
+    stiffness: float,
+    # outputs
+    recovery_count: wp.array(dtype=wp.int32),
+    locked_count: wp.array(dtype=wp.int32),
+    sum_pen_depth: wp.array(dtype=float),
+    max_pen_depth: wp.array(dtype=float),
+):
+    """Apply escape gradient to locked vertices, bypassing OGC truncation.
+
+    One thread per vertex. For vertices whose conservative_bound < epsilon (locked),
+    walks all colliding triangles and accumulates a repulsive escape gradient for
+    each near-contact pair (dis < contact_radius). The gradient is applied directly
+    to particle_q without OGC clamping.
+
+    alpha scales the step size. Metrics (locked_count, recovery_count,
+    sum/max penetration depth) are accumulated atomically for CSV logging.
+    """
+    i = wp.tid()
+
+    if not (particle_flags[i] & ParticleFlags.ACTIVE):
+        return
+    if particle_inv_mass[i] < 1e-10:
+        return
+
+    bound = particle_conservative_bounds[i]
+
+    if bound >= epsilon:
+        return
+
+    wp.atomic_add(locked_count, 0, 1)
+
+    pos_i = particle_q[i]
+    count_i = wp.min(
+        collision_info.vertex_colliding_triangles_count[i],
+        collision_info.vertex_colliding_triangles_buffer_sizes[i],
+    )
+    off_i = collision_info.vertex_colliding_triangles_offsets[i]
+
+    g = wp.vec3(0.0, 0.0, 0.0)
+    n_pairs = int(0)
+
+    for k in range(count_i):
+        tri_idx = collision_info.vertex_colliding_triangles[2 * (off_i + k) + 1]
+        if tri_idx < 0:
+            continue
+
+        a = particle_q[tri_indices[tri_idx, 0]]
+        b = particle_q[tri_indices[tri_idx, 1]]
+        c = particle_q[tri_indices[tri_idx, 2]]
+
+        closest_p, _bary, _feat = triangle_closest_point(a, b, c, pos_i)
+        diff = pos_i - closest_p
+        dis = wp.length(diff)
+
+        if dis < 1e-6 or dis >= contact_radius:
+            continue
+
+        escape_normal = diff / dis
+        dEdD, _ = evaluate_self_contact_force_norm(dis, contact_radius, stiffness)
+        # dEdD < 0 → -dEdD > 0 → f_escape points along escape_normal (repulsive)
+        f_escape = -dEdD * escape_normal
+
+        pen_depth = contact_radius - dis
+        wp.atomic_add(sum_pen_depth, 0, pen_depth)
+        wp.atomic_max(max_pen_depth, 0, pen_depth)
+
+        g = g + f_escape
+        n_pairs += 1
+
+    if n_pairs > 0:
+        particle_q[i] = pos_i + alpha * g
+        wp.atomic_add(recovery_count, 0, 1)

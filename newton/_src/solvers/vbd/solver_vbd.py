@@ -39,6 +39,7 @@ from .particle_vbd_kernels import (
     build_edge_n_ring_edge_collision_filter,
     build_vertex_n_ring_tris_collision_filter,
     accumulate_same_color_watchlist_barrier_kernel,
+    apply_locked_vertex_recovery_kernel,
     build_same_color_watchlist_kernel,
     count_near_penetrations_kernel,
     compute_particle_conservative_bound,
@@ -183,6 +184,10 @@ class SolverVBD(SolverBase):
         same_color_barrier_d_hat: float = -1.0,
         recolor_distance: float = -1.0,
         watchlist_distance: float = -1.0,
+        recovery_alpha: float = 0.0,
+        recovery_epsilon: float = 1e-4,
+        recovery_stiffness: float = 1.0e3,
+        recovery_log_path: str = "",
     ):
         """
         Args:
@@ -294,6 +299,16 @@ class SolverVBD(SolverBase):
             watchlist_distance: Fixed vertex-vertex distance threshold for the watchlist region (m).
                 Same-color pairs with recolor_distance < d <= watchlist_distance enter the watchlist.
                 Default (-1.0) uses 2 * particle_self_contact_margin.
+            recovery_alpha: Step size for the locked-vertex recovery gradient (m / (N/m)).
+                Disabled when 0.0 (default). Applied once per substep after finalize_particles.
+                Requires particle_enable_self_contact=True.
+            recovery_epsilon: OGC bound threshold below which a vertex is considered locked (m).
+                Default 1e-4. Should match the red-dot visualization threshold.
+            recovery_stiffness: Stiffness κ for the per-contact recovery barrier gradient.
+                Default 1e3. Scales the gradient magnitude before alpha is applied.
+            recovery_log_path: Path prefix for CSV metric log. If non-empty, writes
+                /debug/recovery_metrics_{alpha:.4f}.csv each substep.
+                Columns: substep, locked_count, recovery_applied, avg_pen_depth, max_pen_depth.
 
         """
         super().__init__(model)
@@ -340,6 +355,15 @@ class SolverVBD(SolverBase):
         # (set after _init_particle_system once particle_self_contact_margin is known)
         self._recolor_distance_override = recolor_distance
         self._watchlist_distance_override = watchlist_distance
+
+        # Recovery mechanism parameters
+        self.recovery_alpha = recovery_alpha
+        self.recovery_epsilon = recovery_epsilon
+        self.recovery_stiffness = recovery_stiffness
+        self._recovery_log_path = recovery_log_path
+        self._recovery_substep = 0
+        self._recovery_csv_file = None
+        self._recovery_csv_writer = None
 
         if enable_same_color_barrier and not particle_enable_self_contact:
             print(
@@ -584,6 +608,13 @@ class SolverVBD(SolverBase):
             # Stage 6 diagnostic buffers: min same-color distance and near-penetration count
             self.same_color_min_dist = wp.array([3.4e38], dtype=float, device=self.device)
             self.near_penetration_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+
+        # Recovery mechanism buffers (allocated always; used only when recovery_alpha > 0)
+        if particle_enable_self_contact:
+            self._recovery_locked_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._recovery_applied_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._recovery_sum_pen = wp.zeros(1, dtype=float, device=self.device)
+            self._recovery_max_pen = wp.zeros(1, dtype=float, device=self.device)
 
         # Dynamic recoloring state (Stage 4): save original coloring for per-substep restore.
         if dynamic_recoloring and particle_enable_self_contact:
@@ -1131,6 +1162,9 @@ class SolverVBD(SolverBase):
 
         self.finalize_rigid_bodies(state_out, dt)
         self.finalize_particles(state_out, dt)
+
+        if self.recovery_alpha > 0.0 and self.particle_enable_self_contact:
+            self._apply_locked_vertex_recovery(state_out)
 
     def initialize_particles(self, state_in: State, dt: float):
         """Initialize particle positions for the VBD iteration."""
@@ -2448,6 +2482,74 @@ class SolverVBD(SolverBase):
     # ------------------------------------------------------------------
     # Stage 5: Same-color watchlist barrier
     # ------------------------------------------------------------------
+
+    def _apply_locked_vertex_recovery(self, state_out: State) -> None:
+        """Apply escape gradient to locked vertices (conservative_bound < epsilon) after finalize.
+
+        Called once per substep after finalize_particles. Walks each locked vertex's
+        colliding triangles, accumulates repulsive escape gradient for near-contact pairs
+        (dis < particle_self_contact_radius), and applies alpha * gradient directly to
+        particle_q without OGC clamping.
+
+        Logs per-substep metrics to CSV if recovery_log_path was set.
+        """
+        import csv
+        import os
+
+        self._recovery_locked_count.zero_()
+        self._recovery_applied_count.zero_()
+        self._recovery_sum_pen.zero_()
+        self._recovery_max_pen.zero_()
+
+        wp.launch(
+            kernel=apply_locked_vertex_recovery_kernel,
+            dim=self.model.particle_count,
+            inputs=[
+                state_out.particle_q,
+                self.model.particle_flags,
+                self.model.particle_inv_mass,
+                self.particle_conservative_bounds,
+                self.model.tri_indices,
+                self.trimesh_collision_detector.collision_info,
+                self.recovery_alpha,
+                self.recovery_epsilon,
+                self.particle_self_contact_radius,
+                self.recovery_stiffness,
+            ],
+            outputs=[
+                self._recovery_applied_count,
+                self._recovery_locked_count,
+                self._recovery_sum_pen,
+                self._recovery_max_pen,
+            ],
+            device=self.device,
+        )
+
+        locked = int(self._recovery_locked_count.numpy()[0])
+        applied = int(self._recovery_applied_count.numpy()[0])
+        sum_pen = float(self._recovery_sum_pen.numpy()[0])
+        max_pen = float(self._recovery_max_pen.numpy()[0])
+        avg_pen = (sum_pen / applied) if applied > 0 else 0.0
+
+        self._recovery_substep += 1
+
+        if self._recovery_log_path:
+            csv_path = os.path.join(
+                self._recovery_log_path,
+                f"recovery_metrics_{self.recovery_alpha:.4f}.csv",
+            )
+            write_header = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(
+                        ["substep", "locked_count", "recovery_applied",
+                         "avg_pen_depth", "max_pen_depth"]
+                    )
+                writer.writerow(
+                    [self._recovery_substep, locked, applied,
+                     f"{avg_pen:.6f}", f"{max_pen:.6f}"]
+                )
 
     def _launch_same_color_watchlist_barrier(self, current_state: State) -> None:
         """Launch accumulate_same_color_watchlist_barrier_kernel over all watchlist pairs.
