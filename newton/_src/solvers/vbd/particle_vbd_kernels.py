@@ -3356,3 +3356,73 @@ def build_same_color_watchlist_kernel(
                 if wl_idx < max_watchlist_pairs:
                     watchlist_pairs[2 * wl_idx] = wp.int32(i)
                     watchlist_pairs[2 * wl_idx + 1] = wp.int32(j)
+
+
+@wp.kernel
+def accumulate_same_color_watchlist_barrier_kernel(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    watchlist_pairs: wp.array(dtype=wp.int32),
+    watchlist_count: wp.array(dtype=wp.int32),
+    d_hat: float,
+    stiffness: float,
+    # outputs (atomic add)
+    particle_forces: wp.array(dtype=wp.vec3),
+    particle_hessians: wp.array(dtype=wp.mat33),
+):
+    """Accumulate same-color barrier forces for watchlist vertex pairs.
+
+    One thread per watchlist slot. For each pair (i, j) that is currently closer
+    than d_hat, computes a repulsive penalty force and hessian using the same
+    C2-continuous contact energy as the VBD self-contact (evaluate_self_contact_force_norm).
+
+    To mitigate the double-push problem (both same-color vertices update simultaneously
+    toward each other), forces are scaled by inverse-mass weights:
+
+        alpha_i = inv_mass_i / (inv_mass_i + inv_mass_j)
+        alpha_j = inv_mass_j / (inv_mass_i + inv_mass_j)
+
+    This is equivalent to mass_j/(mass_i+mass_j) and ensures each vertex takes the
+    fraction of the barrier response proportional to how mobile it is.
+    Both force and hessian are scaled by the same alpha (preserves Newton step size).
+
+    Pairs beyond watchlist_count are skipped. Pairs where either vertex is inactive
+    or total inv_mass is zero are skipped.
+    """
+    tid = wp.tid()
+    if tid >= watchlist_count[0]:
+        return
+
+    i = int(watchlist_pairs[2 * tid])
+    j = int(watchlist_pairs[2 * tid + 1])
+
+    inv_m_i = particle_inv_mass[i]
+    inv_m_j = particle_inv_mass[j]
+    inv_m_sum = inv_m_i + inv_m_j
+    if inv_m_sum < 1e-12:
+        return  # both vertices pinned
+
+    alpha_i = inv_m_i / inv_m_sum
+    alpha_j = inv_m_j / inv_m_sum
+
+    diff = particle_q[i] - particle_q[j]
+    d = wp.length(diff)
+    if d < 1e-10 or d >= d_hat:
+        return
+
+    n_ij = diff / d  # unit vector from j to i
+
+    dEdD, d2EdD2 = evaluate_self_contact_force_norm(d, d_hat, stiffness)
+
+    # Force: f_i = -dEdD * n_ij  (repulsion: pushes i away from j)
+    f_barrier = -dEdD * n_ij
+    H_barrier = d2EdD2 * wp.outer(n_ij, n_ij)
+
+    if particle_flags[i] & ParticleFlags.ACTIVE:
+        wp.atomic_add(particle_forces, i, alpha_i * f_barrier)
+        wp.atomic_add(particle_hessians, i, alpha_i * H_barrier)
+
+    if particle_flags[j] & ParticleFlags.ACTIVE:
+        wp.atomic_add(particle_forces, j, alpha_j * (-f_barrier))
+        wp.atomic_add(particle_hessians, j, alpha_j * H_barrier)

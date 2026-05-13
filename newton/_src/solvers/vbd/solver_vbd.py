@@ -38,6 +38,7 @@ from .particle_vbd_kernels import (
     accumulate_spring_force_and_hessian,
     build_edge_n_ring_edge_collision_filter,
     build_vertex_n_ring_tris_collision_filter,
+    accumulate_same_color_watchlist_barrier_kernel,
     build_same_color_watchlist_kernel,
     compute_particle_conservative_bound,
     copy_particle_positions_back,
@@ -172,10 +173,13 @@ class SolverVBD(SolverBase):
 
         ogc_contact: bool = False,
         diagnostic_same_color_pairs: bool = False,
-        # Watchlist / dynamic recoloring parameters (Stage 3-4)
+        # Watchlist / dynamic recoloring / same-color barrier parameters (Stage 3-5)
         enable_watchlist: bool = False,
         watchlist_buffer_multiplier: int = 4,
         dynamic_recoloring: bool = False,
+        enable_same_color_barrier: bool = False,
+        same_color_barrier_stiffness: float = 1.0e3,
+        same_color_barrier_d_hat: float = -1.0,
     ):
         """
         Args:
@@ -270,6 +274,17 @@ class SolverVBD(SolverBase):
                 Automatically enables enable_watchlist=True. After each substep, colors are restored
                 to the original static coloring before the next recoloring pass.
                 Requires particle_enable_self_contact=True. Keep optional behind this flag.
+            enable_same_color_barrier: When True, applies an IPC-like repulsive barrier force
+                to same-color watchlist pairs (R_recolor < d <= R_watchlist) that are closer than
+                same_color_barrier_d_hat at each VBD iteration. Forces are scaled by inverse-mass
+                weights (alpha_i = inv_mass_i/(inv_mass_i+inv_mass_j)) to mitigate double-push.
+                Automatically enables enable_watchlist=True.
+                Requires particle_enable_self_contact=True.
+            same_color_barrier_stiffness: Stiffness κ for the same-color barrier potential.
+                Uses the same C2-continuous contact energy as VBD self-contact.
+            same_color_barrier_d_hat: Activation distance threshold for the same-color barrier (m).
+                Pairs closer than this value receive a repulsive force. Default (-1.0) uses
+                particle_self_contact_radius.
 
         """
         super().__init__(model)
@@ -287,8 +302,11 @@ class SolverVBD(SolverBase):
                 "without particle_enable_self_contact=True (OGC bounds are not computed)."
             )
 
-        # dynamic_recoloring requires watchlist to capture recolor pairs
+        # Both dynamic_recoloring and enable_same_color_barrier require the watchlist buffer.
+        # Resolve the final enable_watchlist value before storing it.
         if dynamic_recoloring and not enable_watchlist:
+            enable_watchlist = True
+        if enable_same_color_barrier and not enable_watchlist:
             enable_watchlist = True
 
         self.enable_watchlist = enable_watchlist
@@ -302,6 +320,17 @@ class SolverVBD(SolverBase):
         if dynamic_recoloring and not particle_enable_self_contact:
             print(
                 "[recolor] WARNING: dynamic_recoloring=True has no effect "
+                "without particle_enable_self_contact=True (OGC bounds are not computed)."
+            )
+
+        self.enable_same_color_barrier = enable_same_color_barrier
+        self.same_color_barrier_stiffness = same_color_barrier_stiffness
+        # Resolve d_hat: if negative, use particle_self_contact_radius (set after _init_particle_system)
+        self._same_color_barrier_d_hat_override = same_color_barrier_d_hat
+
+        if enable_same_color_barrier and not particle_enable_self_contact:
+            print(
+                "[barrier] WARNING: enable_same_color_barrier=True has no effect "
                 "without particle_enable_self_contact=True (OGC bounds are not computed)."
             )
 
@@ -335,6 +364,12 @@ class SolverVBD(SolverBase):
             watchlist_buffer_multiplier,
             dynamic_recoloring,
         )
+
+        # Resolve same-color barrier d_hat: default to particle_self_contact_radius
+        if self._same_color_barrier_d_hat_override < 0.0:
+            self.same_color_barrier_d_hat = particle_self_contact_radius
+        else:
+            self.same_color_barrier_d_hat = self._same_color_barrier_d_hat_override
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -1354,6 +1389,10 @@ class SolverVBD(SolverBase):
         if data_collector.is_log_collision():
             self.collision_counter.zero_()
 
+        # Same-color barrier: accumulate watchlist pair forces before color group solves
+        if self.enable_same_color_barrier and self.enable_watchlist:
+            self._launch_same_color_watchlist_barrier(state_in)
+
         # Iterate over color groups
         for color in range(len(model.particle_color_groups)):
             # Accumulate contact forces
@@ -2354,3 +2393,38 @@ class SolverVBD(SolverBase):
         recolor_pairs_np = self.same_color_recolor_pairs.numpy()[: 2 * rc_capped]
 
         self._apply_dynamic_recoloring(recolor_pairs_np)
+
+    # ------------------------------------------------------------------
+    # Stage 5: Same-color watchlist barrier
+    # ------------------------------------------------------------------
+
+    def _launch_same_color_watchlist_barrier(self, current_state: State) -> None:
+        """Launch accumulate_same_color_watchlist_barrier_kernel over all watchlist pairs.
+
+        Adds IPC-like repulsive forces and hessians to particle_forces / particle_hessians
+        for watchlist pairs with d < same_color_barrier_d_hat.
+
+        Forces are scaled by inverse-mass weights (alpha_i = inv_mass_i/(inv_mass_i+inv_mass_j))
+        to mitigate the double-push effect from simultaneous same-color updates.
+
+        Must be called AFTER particle_forces.zero_() / particle_hessians.zero_() and BEFORE
+        the color group solve loop so that the barrier forces are included in each vertex's solve.
+        """
+        wp.launch(
+            kernel=accumulate_same_color_watchlist_barrier_kernel,
+            dim=self.same_color_watchlist_max_pairs,
+            inputs=[
+                current_state.particle_q,
+                self.model.particle_inv_mass,
+                self.model.particle_flags,
+                self.same_color_watchlist_pairs,
+                self.same_color_watchlist_count,
+                self.same_color_barrier_d_hat,
+                self.same_color_barrier_stiffness,
+            ],
+            outputs=[
+                self.particle_forces,
+                self.particle_hessians,
+            ],
+            device=self.device,
+        )
