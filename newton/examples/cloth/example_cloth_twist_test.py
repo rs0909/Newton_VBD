@@ -194,6 +194,10 @@ class Example:
 
             self.model.particle_flags = wp.array(flags)
 
+        # Alpha sweep candidates: 0.01, 0.05, 0.1, 0.5  (scaled by avg edge length ~0.02m)
+        # Start with 0.01 for stability; increase if locked_count does not decrease.
+        recovery_alpha = 0.01
+
         self.solver = newton.solvers.SolverVBD(
             self.model,
             self.iterations,
@@ -206,8 +210,12 @@ class Example:
             enable_watchlist=True,
             dynamic_recoloring=True,
             enable_same_color_barrier=True,
-            same_color_barrier_stiffness = 100,
-            same_color_barrier_d_hat = 0.002
+            same_color_barrier_stiffness=100,
+            same_color_barrier_d_hat=0.002,
+            recovery_alpha=recovery_alpha,
+            recovery_epsilon=1e-4,
+            recovery_stiffness=1e3,
+            recovery_log_path="/debug",
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -286,10 +294,9 @@ class Example:
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
-
+            # Red dots: locked vertices (conservative_bound < 1e-4)
             fixed_counter = wp.zeros(1, dtype=int, device=wp.get_device())
             fixed_particle_positions = wp.empty(self.state_0.particle_count, dtype=wp.vec3, device=wp.get_device())
-                    
             wp.launch(
                 kernel=check_particle_valid,
                 dim=self.state_0.particle_count,
@@ -297,16 +304,20 @@ class Example:
                     self.state_0.particle_q,
                     self.model.particle_inv_mass,
                     self.solver.particle_conservative_bounds,
-                    1e-4
+                    1e-4,
                 ],
-                outputs=[
-                    fixed_counter,
-                    fixed_particle_positions
-                ]
+                outputs=[fixed_counter, fixed_particle_positions],
             )
-
             fixed_num = fixed_counter.numpy()[0]
             debug_contact_points('/debug/fixed_points', self.viewer, fixed_particle_positions.numpy()[:fixed_num], (1, 0, 0), 0.01)
+
+            # Green dots: vertices where recovery gradient was applied this substep
+            if self.solver.recovery_alpha > 0.0:
+                recovered_num = int(self.solver._recovery_applied_count.numpy()[0])
+                recovered_num = min(recovered_num, self.solver.model.particle_count)
+                if recovered_num > 0:
+                    recovered_pos = self.solver._recovery_positions_buf.numpy()[:recovered_num]
+                    debug_contact_points('/debug/recovered_points', self.viewer, recovered_pos, (0, 1, 0), 0.01)
 
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0

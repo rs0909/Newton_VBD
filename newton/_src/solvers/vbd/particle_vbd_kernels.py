@@ -3464,11 +3464,13 @@ def apply_locked_vertex_recovery_kernel(
     epsilon: float,
     contact_radius: float,
     stiffness: float,
+    recovery_positions_max: int,
     # outputs
     recovery_count: wp.array(dtype=wp.int32),
     locked_count: wp.array(dtype=wp.int32),
     sum_pen_depth: wp.array(dtype=float),
     max_pen_depth: wp.array(dtype=float),
+    recovery_positions: wp.array(dtype=wp.vec3),
 ):
     """Apply escape gradient to locked vertices, bypassing OGC truncation.
 
@@ -3533,5 +3535,8 @@ def apply_locked_vertex_recovery_kernel(
         n_pairs += 1
 
     if n_pairs > 0:
-        particle_q[i] = pos_i + alpha * g
-        wp.atomic_add(recovery_count, 0, 1)
+        new_pos = pos_i + alpha * g
+        particle_q[i] = new_pos
+        idx = wp.atomic_add(recovery_count, 0, 1)
+        if idx < recovery_positions_max:
+            recovery_positions[idx] = new_pos

@@ -615,6 +615,10 @@ class SolverVBD(SolverBase):
             self._recovery_applied_count = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._recovery_sum_pen = wp.zeros(1, dtype=float, device=self.device)
             self._recovery_max_pen = wp.zeros(1, dtype=float, device=self.device)
+            # Positions of recovered vertices (indexed by recovery_applied_count)
+            self._recovery_positions_buf = wp.zeros(
+                model.particle_count, dtype=wp.vec3, device=self.device
+            )
 
         # Dynamic recoloring state (Stage 4): save original coloring for per-substep restore.
         if dynamic_recoloring and particle_enable_self_contact:
@@ -2515,12 +2519,14 @@ class SolverVBD(SolverBase):
                 self.recovery_epsilon,
                 self.particle_self_contact_radius,
                 self.recovery_stiffness,
+                self.model.particle_count,
             ],
             outputs=[
                 self._recovery_applied_count,
                 self._recovery_locked_count,
                 self._recovery_sum_pen,
                 self._recovery_max_pen,
+                self._recovery_positions_buf,
             ],
             device=self.device,
         )
