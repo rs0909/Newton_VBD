@@ -3296,13 +3296,15 @@ def build_same_color_watchlist_kernel(
     particle_colors: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
     collision_info: TriMeshCollisionInfo,
-    max_pairs: int,
+    max_watchlist_pairs: int,
+    max_recolor_pairs: int,
     # outputs
     watchlist_pairs: wp.array(dtype=wp.int32),
     watchlist_count: wp.array(dtype=wp.int32),
+    recolor_pairs: wp.array(dtype=wp.int32),
     recolor_count: wp.array(dtype=wp.int32),
 ):
-    """Populate GPU watchlist of same-color vertex pairs from existing OGC collision buffers.
+    """Populate GPU watchlist and recolor buffers of same-color vertex pairs.
 
     One thread per vertex i. Walks vertex_colliding_triangles for vertex i and checks each
     triangle vertex j (j > i, same color) against R_recolor and R_watchlist.
@@ -3310,12 +3312,12 @@ def build_same_color_watchlist_kernel(
     R_recolor(i,j)   = r[i] + r[j]
     R_watchlist(i,j) = 2*r[i] + 2*r[j]
 
+    Pairs in the recolor region (d <= R_recolor) are written atomically to recolor_pairs.
     Pairs in the watchlist region (R_recolor < d <= R_watchlist) are written atomically
-    to the flat watchlist_pairs buffer. Pairs in the recolor region (d <= R_recolor) are
-    counted in recolor_count for diagnostics only.
+    to watchlist_pairs.
 
     Note: duplicate pairs from multiple shared triangles are possible and not deduplicated.
-    Pairs beyond max_pairs are silently dropped (caller checks watchlist_count vs max_pairs).
+    Pairs beyond max_*_pairs are silently dropped (caller checks counts vs max).
     """
     i = wp.tid()
     color_i = particle_colors[i]
@@ -3345,9 +3347,12 @@ def build_same_color_watchlist_kernel(
             R_watchlist_ij = 2.0 * r_i + 2.0 * r_j
 
             if d <= R_recolor_ij:
-                wp.atomic_add(recolor_count, 0, 1)
+                rc_idx = wp.atomic_add(recolor_count, 0, 1)
+                if rc_idx < max_recolor_pairs:
+                    recolor_pairs[2 * rc_idx] = wp.int32(i)
+                    recolor_pairs[2 * rc_idx + 1] = wp.int32(j)
             elif d <= R_watchlist_ij:
-                idx = wp.atomic_add(watchlist_count, 0, 1)
-                if idx < max_pairs:
-                    watchlist_pairs[2 * idx] = wp.int32(i)
-                    watchlist_pairs[2 * idx + 1] = wp.int32(j)
+                wl_idx = wp.atomic_add(watchlist_count, 0, 1)
+                if wl_idx < max_watchlist_pairs:
+                    watchlist_pairs[2 * wl_idx] = wp.int32(i)
+                    watchlist_pairs[2 * wl_idx + 1] = wp.int32(j)

@@ -172,9 +172,10 @@ class SolverVBD(SolverBase):
 
         ogc_contact: bool = False,
         diagnostic_same_color_pairs: bool = False,
-        # Watchlist parameters (Stage 3)
+        # Watchlist / dynamic recoloring parameters (Stage 3-4)
         enable_watchlist: bool = False,
         watchlist_buffer_multiplier: int = 4,
+        dynamic_recoloring: bool = False,
     ):
         """
         Args:
@@ -257,17 +258,22 @@ class SolverVBD(SolverBase):
                 Requires particle_enable_self_contact=True (OGC bounds must be available).
             enable_watchlist: When True, builds a GPU-resident flat buffer of same-color vertex pairs in the
                 watchlist region (R_recolor < d <= R_watchlist) after each OGC bound computation.
-                Pairs in the recolor region (d <= R_recolor) are counted separately for diagnostics.
-                Does not change solver behavior. Requires particle_enable_self_contact=True.
+                Pairs in the recolor region (d <= R_recolor) are stored for potential recoloring.
+                Does not change solver behavior by itself. Requires particle_enable_self_contact=True.
                 This buffer is the foundation for the Stage 5 same-color barrier.
-            watchlist_buffer_multiplier: Pre-allocation scale for the watchlist pair buffer.
+            watchlist_buffer_multiplier: Pre-allocation scale for the watchlist/recolor pair buffers.
                 Buffer capacity = watchlist_buffer_multiplier * particle_count pairs.
                 If the actual pair count exceeds capacity, excess pairs are silently dropped
                 and a warning is printed. Increase this value if overflow warnings appear.
+            dynamic_recoloring: When True, dynamically reassigns vertex colors before each substep
+                to separate same-color pairs in the recolor region (d <= R_recolor = r[i] + r[j]).
+                Automatically enables enable_watchlist=True. After each substep, colors are restored
+                to the original static coloring before the next recoloring pass.
+                Requires particle_enable_self_contact=True. Keep optional behind this flag.
 
         """
         super().__init__(model)
-        
+
         self.ogc_contact = ogc_contact
         if self.ogc_contact:
             print()
@@ -281,10 +287,21 @@ class SolverVBD(SolverBase):
                 "without particle_enable_self_contact=True (OGC bounds are not computed)."
             )
 
+        # dynamic_recoloring requires watchlist to capture recolor pairs
+        if dynamic_recoloring and not enable_watchlist:
+            enable_watchlist = True
+
         self.enable_watchlist = enable_watchlist
         if enable_watchlist and not particle_enable_self_contact:
             print(
                 "[watchlist] WARNING: enable_watchlist=True has no effect "
+                "without particle_enable_self_contact=True (OGC bounds are not computed)."
+            )
+
+        self.dynamic_recoloring = dynamic_recoloring
+        if dynamic_recoloring and not particle_enable_self_contact:
+            print(
+                "[recolor] WARNING: dynamic_recoloring=True has no effect "
                 "without particle_enable_self_contact=True (OGC bounds are not computed)."
             )
 
@@ -316,6 +333,7 @@ class SolverVBD(SolverBase):
             particle_external_edge_contact_filtering_map,
             enable_watchlist,
             watchlist_buffer_multiplier,
+            dynamic_recoloring,
         )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
@@ -360,6 +378,7 @@ class SolverVBD(SolverBase):
         particle_external_edge_contact_filtering_map: dict | None,
         enable_watchlist: bool = False,
         watchlist_buffer_multiplier: int = 4,
+        dynamic_recoloring: bool = False,
     ):
         """Initialize particle-specific data structures and settings."""
         # Early exit if no particles
@@ -479,7 +498,7 @@ class SolverVBD(SolverBase):
             self.contacts_v_list = wp.empty(self.all_collision_count, dtype=wp.vec4i, device=self.device)
             self.contacts_mu = wp.empty(self.all_collision_count, dtype=float, device=self.device)
 
-        # Watchlist buffers (Stage 3): GPU-resident same-color pair list
+        # Watchlist/recolor buffers (Stage 3-4): GPU-resident same-color pair lists.
         # Populated by build_same_color_watchlist_kernel after each OGC bound computation.
         # Only allocated when both enable_watchlist and particle_enable_self_contact are True.
         if enable_watchlist and particle_enable_self_contact:
@@ -488,8 +507,32 @@ class SolverVBD(SolverBase):
                 2 * max_pairs, dtype=wp.int32, device=self.device
             )
             self.same_color_watchlist_count = wp.zeros(1, dtype=wp.int32, device=self.device)
-            self.same_color_recolor_count = wp.zeros(1, dtype=wp.int32, device=self.device)
             self.same_color_watchlist_max_pairs = max_pairs
+            # Recolor pairs buffer: pairs with d <= R_recolor that need color splitting
+            max_recolor_pairs = max(max_pairs // 2, 1)
+            self.same_color_recolor_pairs = wp.zeros(
+                2 * max_recolor_pairs, dtype=wp.int32, device=self.device
+            )
+            self.same_color_recolor_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self.same_color_recolor_max_pairs = max_recolor_pairs
+
+        # Dynamic recoloring state (Stage 4): save original coloring for per-substep restore.
+        if dynamic_recoloring and particle_enable_self_contact:
+            # Save original static coloring so it can be restored before each recoloring pass.
+            self._orig_particle_colors_np = model.particle_colors.numpy().copy()
+            self._orig_particle_color_groups = [
+                g.numpy().copy() for g in model.particle_color_groups
+            ]
+            # Build mesh-edge neighbor adjacency for greedy recoloring.
+            # edge_indices[:, 2] and [:, 3] are the two endpoint vertex indices.
+            n = model.particle_count
+            self._recolor_neighbors: list[set[int]] = [set() for _ in range(n)]
+            if model.edge_indices is not None and model.edge_indices.shape[0] > 0:
+                edges_np = model.edge_indices.numpy()  # shape (E, >=4)
+                for row in edges_np:
+                    v0, v1 = int(row[2]), int(row[3])
+                    self._recolor_neighbors[v0].add(v1)
+                    self._recolor_neighbors[v1].add(v0)
 
         # Validation
         if len(self.model.particle_color_groups) == 0:
@@ -1029,6 +1072,11 @@ class SolverVBD(SolverBase):
             return
 
         if self.particle_enable_self_contact:
+            # Dynamic recoloring: restore original static coloring before collision detection
+            # so that the watchlist kernel sees canonical same-color pairs, not stale recolored ones.
+            if self.dynamic_recoloring:
+                self._restore_original_colors()
+
             # Collision detection before initialization to compute conservative bounds
             if data_collector.is_log_nothing():
                 self.collision_detection_penetration_free(state_in, -1)
@@ -1037,6 +1085,10 @@ class SolverVBD(SolverBase):
 
             if self.diagnostic_same_color_pairs:
                 self._diagnose_same_color_pairs(state_in)
+
+            # Dynamic recoloring: apply greedy reassignment for recolor-region pairs
+            if self.dynamic_recoloring:
+                self._apply_dynamic_recoloring_from_gpu()
 
             wp.launch(
                 kernel=forward_step_penetration_free,
@@ -2093,11 +2145,12 @@ class SolverVBD(SolverBase):
             self.trimesh_collision_detector.rebuild(state.particle_q)
 
     def _run_watchlist_kernel(self, current_state: State) -> None:
-        """Zero watchlist counters, launch build_same_color_watchlist_kernel, print diagnostics.
+        """Zero watchlist/recolor counters, launch build_same_color_watchlist_kernel, print diagnostics.
 
         Called after compute_particle_conservative_bound whenever enable_watchlist=True.
-        self.same_color_watchlist_pairs is populated with (i, j) pairs in the watchlist region.
-        self.same_color_recolor_count counts pairs in the recolor region (diagnostic only).
+        After return:
+          - same_color_watchlist_pairs: (i,j) pairs in the watchlist region (R_recolor < d <= R_watchlist)
+          - same_color_recolor_pairs:   (i,j) pairs in the recolor region   (d <= R_recolor)
         """
         self.same_color_watchlist_count.zero_()
         self.same_color_recolor_count.zero_()
@@ -2111,10 +2164,12 @@ class SolverVBD(SolverBase):
                 self.model.tri_indices,
                 self.trimesh_collision_detector.collision_info,
                 self.same_color_watchlist_max_pairs,
+                self.same_color_recolor_max_pairs,
             ],
             outputs=[
                 self.same_color_watchlist_pairs,
                 self.same_color_watchlist_count,
+                self.same_color_recolor_pairs,
                 self.same_color_recolor_count,
             ],
             dim=self.model.particle_count,
@@ -2123,10 +2178,11 @@ class SolverVBD(SolverBase):
 
         wl = int(self.same_color_watchlist_count.numpy()[0])
         rc = int(self.same_color_recolor_count.numpy()[0])
-        overflow = wl > self.same_color_watchlist_max_pairs
-        overflow_str = " OVERFLOW" if overflow else ""
+        wl_overflow = wl > self.same_color_watchlist_max_pairs
+        rc_overflow = rc > self.same_color_recolor_max_pairs
+        overflow_str = (" WL_OVERFLOW" if wl_overflow else "") + (" RC_OVERFLOW" if rc_overflow else "")
         print(
-            f"[watchlist] recolor={rc} "
+            f"[watchlist] recolor={min(rc, self.same_color_recolor_max_pairs)}/{self.same_color_recolor_max_pairs} "
             f"watchlist={min(wl, self.same_color_watchlist_max_pairs)}/{self.same_color_watchlist_max_pairs}"
             f"{overflow_str}"
         )
@@ -2218,3 +2274,83 @@ class SolverVBD(SolverBase):
             f"watchlist={n_watchlist} "
             f"min_dist={min_dist_str}"
         )
+
+    # ------------------------------------------------------------------
+    # Stage 4: Dynamic recoloring helpers
+    # ------------------------------------------------------------------
+
+    def _restore_original_colors(self) -> None:
+        """Restore particle_colors and particle_color_groups to the saved static coloring."""
+        colors_np = self._orig_particle_colors_np.copy()
+        self.model.particle_colors = wp.array(colors_np, dtype=wp.int32, device=self.device)
+        self.model.particle_color_groups = [
+            wp.array(g, dtype=wp.int32, device=self.device)
+            for g in self._orig_particle_color_groups
+        ]
+
+    def _apply_dynamic_recoloring(self, recolor_pairs_np: "np.ndarray") -> None:
+        """Greedy CPU recoloring: reassign colors to separate same-color pairs in recolor region.
+
+        For each pair (i, j) with the same color, reassign j (the higher-index vertex) to the
+        smallest color not used by its mesh neighbors AND not the current color of i.
+        This prevents both vertices from being updated in the same parallel sweep.
+
+        Args:
+            recolor_pairs_np: int32 numpy array of shape (2*K,) with pairs [i0, j0, i1, j1, ...].
+        """
+        import numpy as np
+
+        colors_np = self._orig_particle_colors_np.copy()
+        n_pairs = len(recolor_pairs_np) // 2
+        n_applied = 0
+
+        for k in range(n_pairs):
+            i = int(recolor_pairs_np[2 * k])
+            j = int(recolor_pairs_np[2 * k + 1])
+            if colors_np[i] != colors_np[j]:
+                # already separated by an earlier reassignment
+                continue
+
+            # Forbidden: all colors used by j's mesh neighbors, plus i's current color
+            forbidden = {int(colors_np[nb]) for nb in self._recolor_neighbors[j]}
+            forbidden.add(int(colors_np[i]))
+
+            # Find smallest non-negative color not in forbidden
+            new_color = 0
+            while new_color in forbidden:
+                new_color += 1
+
+            colors_np[j] = new_color
+            n_applied += 1
+
+        # Rebuild color groups from updated colors array
+        num_colors = int(colors_np.max()) + 1
+        color_groups = [[] for _ in range(num_colors)]
+        for v, c in enumerate(colors_np):
+            color_groups[int(c)].append(v)
+
+        # Push updated coloring back to GPU
+        self.model.particle_colors = wp.array(colors_np, dtype=wp.int32, device=self.device)
+        self.model.particle_color_groups = [
+            wp.array(g, dtype=wp.int32, device=self.device)
+            for g in color_groups
+            if len(g) > 0
+        ]
+
+        print(f"[recolor] applied={n_applied} total_colors={num_colors}")
+
+    def _apply_dynamic_recoloring_from_gpu(self) -> None:
+        """Download recolor pairs from GPU and apply greedy dynamic recoloring on CPU.
+
+        Assumes _restore_original_colors() has already been called before the watchlist
+        kernel ran, so model.particle_colors currently holds the canonical static coloring.
+        """
+        rc = int(self.same_color_recolor_count.numpy()[0])
+        if rc == 0:
+            return
+
+        # Cap at buffer capacity (excess pairs were dropped by kernel)
+        rc_capped = min(rc, self.same_color_recolor_max_pairs)
+        recolor_pairs_np = self.same_color_recolor_pairs.numpy()[: 2 * rc_capped]
+
+        self._apply_dynamic_recoloring(recolor_pairs_np)
