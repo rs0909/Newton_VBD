@@ -3292,10 +3292,11 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
 @wp.kernel
 def build_same_color_watchlist_kernel(
     particle_q: wp.array(dtype=wp.vec3),
-    particle_conservative_bounds: wp.array(dtype=float),
     particle_colors: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
     collision_info: TriMeshCollisionInfo,
+    R_recolor_fixed: float,
+    R_watchlist_fixed: float,
     max_watchlist_pairs: int,
     max_recolor_pairs: int,
     # outputs
@@ -3308,14 +3309,13 @@ def build_same_color_watchlist_kernel(
     """Populate GPU watchlist and recolor buffers of same-color vertex pairs.
 
     One thread per vertex i. Walks vertex_colliding_triangles for vertex i and checks each
-    triangle vertex j (j > i, same color) against R_recolor and R_watchlist.
+    triangle vertex j (j > i, same color) against fixed distance thresholds.
 
-    R_recolor(i,j)   = r[i] + r[j]
-    R_watchlist(i,j) = 2*r[i] + 2*r[j]
+    R_recolor_fixed:   pairs with d <= R_recolor_fixed go to recolor_pairs
+    R_watchlist_fixed: pairs with R_recolor_fixed < d <= R_watchlist_fixed go to watchlist_pairs
 
-    Pairs in the recolor region (d <= R_recolor) are written atomically to recolor_pairs.
-    Pairs in the watchlist region (R_recolor < d <= R_watchlist) are written atomically
-    to watchlist_pairs.
+    Pairs in the recolor region are written atomically to recolor_pairs.
+    Pairs in the watchlist region are written atomically to watchlist_pairs.
     All detected same-color pairs contribute to the min_same_color_dist reduction.
 
     Note: duplicate pairs from multiple shared triangles are possible and not deduplicated.
@@ -3323,7 +3323,6 @@ def build_same_color_watchlist_kernel(
     """
     i = wp.tid()
     color_i = particle_colors[i]
-    r_i = particle_conservative_bounds[i]
     pos_i = particle_q[i]
 
     count_i = wp.min(
@@ -3343,21 +3342,17 @@ def build_same_color_watchlist_kernel(
             if particle_colors[j] != color_i:
                 continue
 
-            r_j = particle_conservative_bounds[j]
             d = wp.length(particle_q[j] - pos_i)
 
             # Track minimum distance across all detected same-color pairs (Stage 6 diagnostic)
             wp.atomic_min(min_same_color_dist, 0, d)
 
-            R_recolor_ij = r_i + r_j
-            R_watchlist_ij = 2.0 * r_i + 2.0 * r_j
-
-            if d <= R_recolor_ij:
+            if d <= R_recolor_fixed:
                 rc_idx = wp.atomic_add(recolor_count, 0, 1)
                 if rc_idx < max_recolor_pairs:
                     recolor_pairs[2 * rc_idx] = wp.int32(i)
                     recolor_pairs[2 * rc_idx + 1] = wp.int32(j)
-            elif d <= R_watchlist_ij:
+            elif d <= R_watchlist_fixed:
                 wl_idx = wp.atomic_add(watchlist_count, 0, 1)
                 if wl_idx < max_watchlist_pairs:
                     watchlist_pairs[2 * wl_idx] = wp.int32(i)

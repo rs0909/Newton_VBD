@@ -181,6 +181,8 @@ class SolverVBD(SolverBase):
         enable_same_color_barrier: bool = False,
         same_color_barrier_stiffness: float = 1.0e3,
         same_color_barrier_d_hat: float = -1.0,
+        recolor_distance: float = -1.0,
+        watchlist_distance: float = -1.0,
     ):
         """
         Args:
@@ -286,6 +288,12 @@ class SolverVBD(SolverBase):
             same_color_barrier_d_hat: Activation distance threshold for the same-color barrier (m).
                 Pairs closer than this value receive a repulsive force. Default (-1.0) uses
                 particle_self_contact_radius.
+            recolor_distance: Fixed vertex-vertex distance threshold for the recolor region (m).
+                Same-color pairs with d <= recolor_distance are candidates for dynamic recoloring.
+                Default (-1.0) uses particle_self_contact_margin.
+            watchlist_distance: Fixed vertex-vertex distance threshold for the watchlist region (m).
+                Same-color pairs with recolor_distance < d <= watchlist_distance enter the watchlist.
+                Default (-1.0) uses 2 * particle_self_contact_margin.
 
         """
         super().__init__(model)
@@ -328,6 +336,10 @@ class SolverVBD(SolverBase):
         self.same_color_barrier_stiffness = same_color_barrier_stiffness
         # Resolve d_hat: if negative, use particle_self_contact_radius (set after _init_particle_system)
         self._same_color_barrier_d_hat_override = same_color_barrier_d_hat
+        # Resolve recolor/watchlist fixed thresholds: if negative, use margin-based defaults
+        # (set after _init_particle_system once particle_self_contact_margin is known)
+        self._recolor_distance_override = recolor_distance
+        self._watchlist_distance_override = watchlist_distance
 
         if enable_same_color_barrier and not particle_enable_self_contact:
             print(
@@ -366,11 +378,29 @@ class SolverVBD(SolverBase):
             dynamic_recoloring,
         )
 
-        # Resolve same-color barrier d_hat: default to particle_self_contact_radius
+        # Resolve fixed recolor/watchlist thresholds first (d_hat default depends on R_recolor)
+        margin = particle_self_contact_margin
+        if self._recolor_distance_override < 0.0:
+            self.recolor_fixed_threshold = margin
+        else:
+            self.recolor_fixed_threshold = self._recolor_distance_override
+        if self._watchlist_distance_override < 0.0:
+            self.watchlist_fixed_threshold = 2.0 * margin
+        else:
+            self.watchlist_fixed_threshold = self._watchlist_distance_override
+
+        # Resolve same-color barrier d_hat: default to R_recolor so barrier fires as pairs
+        # approach the recolor zone from the watchlist region during VBD iterations
         if self._same_color_barrier_d_hat_override < 0.0:
-            self.same_color_barrier_d_hat = particle_self_contact_radius
+            self.same_color_barrier_d_hat = self.recolor_fixed_threshold
         else:
             self.same_color_barrier_d_hat = self._same_color_barrier_d_hat_override
+
+        print(
+            f"[watchlist] R_recolor={self.recolor_fixed_threshold:.4f}m  "
+            f"R_watchlist={self.watchlist_fixed_threshold:.4f}m  "
+            f"d_hat={self.same_color_barrier_d_hat:.4f}m"
+        )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -2207,10 +2237,11 @@ class SolverVBD(SolverBase):
             kernel=build_same_color_watchlist_kernel,
             inputs=[
                 current_state.particle_q,
-                self.particle_conservative_bounds,
                 self.model.particle_colors,
                 self.model.tri_indices,
                 self.trimesh_collision_detector.collision_info,
+                self.recolor_fixed_threshold,
+                self.watchlist_fixed_threshold,
                 self.same_color_watchlist_max_pairs,
                 self.same_color_recolor_max_pairs,
             ],
@@ -2257,35 +2288,26 @@ class SolverVBD(SolverBase):
         )
 
     def _diagnose_same_color_pairs(self, current_state: State) -> None:
-        """CPU-side diagnostic: count same-color vertex pairs using existing OGC collision buffers.
+        """CPU-side diagnostic: count same-color vertex pairs using existing collision buffers.
 
         Categorizes same-color proximate pairs into recolor / watchlist / ignore regions
-        using the OGC per-vertex conservative bound as r_recolor:
+        using fixed distance thresholds:
 
-            R_recolor(i, j)   = r_recolor[i] + r_recolor[j]
-            R_watchlist(i, j) = 2 * r_recolor[i] + 2 * r_recolor[j]
-
-        Source of r_recolor: self.particle_conservative_bounds (already computed by
-        compute_particle_conservative_bound before this call).
-
-        Limitation: requires particle_enable_self_contact=True. If False, OGC bounds are
-        not computed and R_recolor/R_watchlist cannot be derived; a warning is printed and
-        the method returns immediately without a fallback formula.
+            R_recolor   = self.recolor_fixed_threshold
+            R_watchlist = self.watchlist_fixed_threshold
 
         Does not modify any solver state. Runs on CPU; intended for debugging only.
         """
         if not self.particle_enable_self_contact:
             print(
                 "[same-color diag] WARNING: particle_enable_self_contact=False. "
-                "OGC bounds (particle_conservative_bounds) are not computed. "
-                "Cannot evaluate R_recolor / R_watchlist. Skipping."
+                "Collision buffers are not populated. Skipping."
             )
             return
 
         # --- Download GPU data to CPU numpy ---
         particle_q = current_state.particle_q.numpy()          # (N, 3)
         particle_colors = self.model.particle_colors.numpy()   # (N,)  int
-        r_recolor = self.particle_conservative_bounds.numpy()  # (N,)  float  = relaxation * min_dist
         tri_indices = self.model.tri_indices.numpy()           # (T, 3) int
 
         detector = self.trimesh_collision_detector
@@ -2293,6 +2315,9 @@ class SolverVBD(SolverBase):
         vt_buf_sizes = detector.vertex_colliding_triangles_buffer_sizes.numpy()  # (N,)
         vt_offsets = detector.vertex_colliding_triangles_offsets.numpy()    # (N+1,)
         vt_data = detector.vertex_colliding_triangles.numpy()               # flat int32
+
+        R_recolor = self.recolor_fixed_threshold
+        R_watchlist = self.watchlist_fixed_threshold
 
         n_candidate = 0
         n_recolor = 0
@@ -2302,7 +2327,6 @@ class SolverVBD(SolverBase):
 
         for i in range(self.model.particle_count):
             color_i = int(particle_colors[i])
-            r_i = float(r_recolor[i])
             # cap at the actual buffer size to skip overflow slots
             count_i = int(min(vt_count[i], vt_buf_sizes[i]))
             off_i = int(vt_offsets[i])
@@ -2324,16 +2348,13 @@ class SolverVBD(SolverBase):
                     seen.add(pair)
 
                     d = float(np.linalg.norm(particle_q[i] - particle_q[j]))
-                    r_j = float(r_recolor[j])
-                    R_recolor_ij = r_i + r_j
-                    R_watchlist_ij = 2.0 * r_i + 2.0 * r_j
 
                     n_candidate += 1
                     if d < min_same_color_dist:
                         min_same_color_dist = d
-                    if d <= R_recolor_ij:
+                    if d <= R_recolor:
                         n_recolor += 1
-                    elif d <= R_watchlist_ij:
+                    elif d <= R_watchlist:
                         n_watchlist += 1
 
         min_dist_str = f"{min_same_color_dist:.6f}" if n_candidate > 0 else "N/A"

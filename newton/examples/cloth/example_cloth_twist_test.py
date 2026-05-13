@@ -139,7 +139,7 @@ class Example:
         self.sim_substeps = 10  # must be an even number when using CUDA Graph
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.iterations = 4
+        self.iterations = 20
         # the BVH used by SolverVBD will be rebuilt every self.bvh_rebuild_frames
         # When the simulated object deforms significantly, simply refitting the BVH can lead to deterioration of the BVH's
         # quality, in this case we need to completely rebuild the tree to achieve better query efficiency.
@@ -202,6 +202,12 @@ class Example:
             particle_self_contact_margin=0.0035,
             # particle_conservative_bound_relaxation=0.8
             ogc_contact=True,
+            diagnostic_same_color_pairs=True,
+            enable_watchlist=True,
+            dynamic_recoloring=True,
+            enable_same_color_barrier=True,
+            same_color_barrier_stiffness = 100,
+            same_color_barrier_d_hat = 0.002
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
