@@ -3303,6 +3303,7 @@ def build_same_color_watchlist_kernel(
     watchlist_count: wp.array(dtype=wp.int32),
     recolor_pairs: wp.array(dtype=wp.int32),
     recolor_count: wp.array(dtype=wp.int32),
+    min_same_color_dist: wp.array(dtype=float),
 ):
     """Populate GPU watchlist and recolor buffers of same-color vertex pairs.
 
@@ -3315,6 +3316,7 @@ def build_same_color_watchlist_kernel(
     Pairs in the recolor region (d <= R_recolor) are written atomically to recolor_pairs.
     Pairs in the watchlist region (R_recolor < d <= R_watchlist) are written atomically
     to watchlist_pairs.
+    All detected same-color pairs contribute to the min_same_color_dist reduction.
 
     Note: duplicate pairs from multiple shared triangles are possible and not deduplicated.
     Pairs beyond max_*_pairs are silently dropped (caller checks counts vs max).
@@ -3343,6 +3345,10 @@ def build_same_color_watchlist_kernel(
 
             r_j = particle_conservative_bounds[j]
             d = wp.length(particle_q[j] - pos_i)
+
+            # Track minimum distance across all detected same-color pairs (Stage 6 diagnostic)
+            wp.atomic_min(min_same_color_dist, 0, d)
+
             R_recolor_ij = r_i + r_j
             R_watchlist_ij = 2.0 * r_i + 2.0 * r_j
 
@@ -3356,6 +3362,29 @@ def build_same_color_watchlist_kernel(
                 if wl_idx < max_watchlist_pairs:
                     watchlist_pairs[2 * wl_idx] = wp.int32(i)
                     watchlist_pairs[2 * wl_idx + 1] = wp.int32(j)
+
+
+@wp.kernel
+def count_near_penetrations_kernel(
+    collision_info: TriMeshCollisionInfo,
+    threshold: float,
+    # output
+    near_penetration_count: wp.array(dtype=wp.int32),
+):
+    """Count vertices whose nearest-triangle distance is below threshold.
+
+    Uses vertex_colliding_triangles_min_dist which stores the minimum geometric distance
+    from each vertex to any colliding triangle found within the BVH search radius.
+    A distance below threshold indicates the vertex is in or very near the contact zone.
+
+    Args:
+        threshold: Distance cutoff (typically particle_self_contact_radius).
+        near_penetration_count: Output counter, incremented atomically per qualifying vertex.
+    """
+    i = wp.tid()
+    d_min = collision_info.vertex_colliding_triangles_min_dist[i]
+    if d_min < threshold:
+        wp.atomic_add(near_penetration_count, 0, 1)
 
 
 @wp.kernel

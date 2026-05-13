@@ -40,6 +40,7 @@ from .particle_vbd_kernels import (
     build_vertex_n_ring_tris_collision_filter,
     accumulate_same_color_watchlist_barrier_kernel,
     build_same_color_watchlist_kernel,
+    count_near_penetrations_kernel,
     compute_particle_conservative_bound,
     copy_particle_positions_back,
     # Adjacency building kernels
@@ -550,6 +551,9 @@ class SolverVBD(SolverBase):
             )
             self.same_color_recolor_count = wp.zeros(1, dtype=wp.int32, device=self.device)
             self.same_color_recolor_max_pairs = max_recolor_pairs
+            # Stage 6 diagnostic buffers: min same-color distance and near-penetration count
+            self.same_color_min_dist = wp.array([3.4e38], dtype=float, device=self.device)
+            self.near_penetration_count = wp.zeros(1, dtype=wp.int32, device=self.device)
 
         # Dynamic recoloring state (Stage 4): save original coloring for per-substep restore.
         if dynamic_recoloring and particle_enable_self_contact:
@@ -2190,9 +2194,14 @@ class SolverVBD(SolverBase):
         After return:
           - same_color_watchlist_pairs: (i,j) pairs in the watchlist region (R_recolor < d <= R_watchlist)
           - same_color_recolor_pairs:   (i,j) pairs in the recolor region   (d <= R_recolor)
+          - same_color_min_dist:        minimum vertex-vertex distance over all detected same-color pairs
+          - near_penetration_count:     number of vertices with nearest-triangle distance < contact_radius
         """
         self.same_color_watchlist_count.zero_()
         self.same_color_recolor_count.zero_()
+        self.near_penetration_count.zero_()
+        # Reset min_dist sentinel to large value before atomic_min reduction
+        self.same_color_min_dist = wp.array([3.4e38], dtype=float, device=self.device)
 
         wp.launch(
             kernel=build_same_color_watchlist_kernel,
@@ -2210,6 +2219,21 @@ class SolverVBD(SolverBase):
                 self.same_color_watchlist_count,
                 self.same_color_recolor_pairs,
                 self.same_color_recolor_count,
+                self.same_color_min_dist,
+            ],
+            dim=self.model.particle_count,
+            device=self.device,
+        )
+
+        # Stage 6: count vertices near penetration (d < contact_radius to nearest triangle)
+        wp.launch(
+            kernel=count_near_penetrations_kernel,
+            inputs=[
+                self.trimesh_collision_detector.collision_info,
+                self.particle_self_contact_radius,
+            ],
+            outputs=[
+                self.near_penetration_count,
             ],
             dim=self.model.particle_count,
             device=self.device,
@@ -2217,12 +2241,18 @@ class SolverVBD(SolverBase):
 
         wl = int(self.same_color_watchlist_count.numpy()[0])
         rc = int(self.same_color_recolor_count.numpy()[0])
+        min_d_raw = float(self.same_color_min_dist.numpy()[0])
+        near_pen = int(self.near_penetration_count.numpy()[0])
+
         wl_overflow = wl > self.same_color_watchlist_max_pairs
         rc_overflow = rc > self.same_color_recolor_max_pairs
         overflow_str = (" WL_OVERFLOW" if wl_overflow else "") + (" RC_OVERFLOW" if rc_overflow else "")
+        min_d_str = f"{min_d_raw:.6f}" if min_d_raw < 3.0e38 else "N/A"
         print(
             f"[watchlist] recolor={min(rc, self.same_color_recolor_max_pairs)}/{self.same_color_recolor_max_pairs} "
-            f"watchlist={min(wl, self.same_color_watchlist_max_pairs)}/{self.same_color_watchlist_max_pairs}"
+            f"watchlist={min(wl, self.same_color_watchlist_max_pairs)}/{self.same_color_watchlist_max_pairs} "
+            f"min_sc_dist={min_d_str} "
+            f"near_pen={near_pen}"
             f"{overflow_str}"
         )
 
