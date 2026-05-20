@@ -40,6 +40,7 @@ from .particle_vbd_kernels import (
     build_vertex_n_ring_tris_collision_filter,
     accumulate_same_color_watchlist_barrier_kernel,
     apply_locked_vertex_recovery_kernel,
+    apply_planar_dat_to_all_kernel,
     build_same_color_watchlist_kernel,
     count_near_penetrations_kernel,
     compute_particle_conservative_bound,
@@ -188,6 +189,8 @@ class SolverVBD(SolverBase):
         recovery_epsilon: float = 1e-4,
         recovery_stiffness: float = 1.0e3,
         recovery_log_path: str = "",
+        use_planar_dat: bool = False,
+        planar_dat_gamma_r: float = 0.9,
     ):
         """
         Args:
@@ -365,6 +368,10 @@ class SolverVBD(SolverBase):
         self._recovery_csv_file = None
         self._recovery_csv_writer = None
 
+        # Planar-DAT parameters
+        self.use_planar_dat = use_planar_dat
+        self.planar_dat_gamma_r = planar_dat_gamma_r
+
         if enable_same_color_barrier and not particle_enable_self_contact:
             print(
                 "[barrier] WARNING: enable_same_color_barrier=True has no effect "
@@ -521,6 +528,7 @@ class SolverVBD(SolverBase):
                 v_adj_edges_offsets=self.particle_adjacency.v_adj_edges_offsets,
                 v_adj_faces=self.particle_adjacency.v_adj_faces,
                 v_adj_faces_offsets=self.particle_adjacency.v_adj_faces_offsets,
+                record_triangle_contacting_vertices=self.use_planar_dat,
             )
 
             self.compute_particle_contact_filtering_list(
@@ -609,6 +617,11 @@ class SolverVBD(SolverBase):
             self.same_color_min_dist = wp.array([3.4e38], dtype=float, device=self.device)
             self.near_penetration_count = wp.zeros(1, dtype=wp.int32, device=self.device)
 
+        # Tight penetration counter: vertices with min_dist < 1e-4 at substep start
+        if particle_enable_self_contact:
+            self._tight_pen_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._tight_pen_threshold = 1e-4  # 0.1 mm
+
         # Recovery mechanism buffers (allocated always; used only when recovery_alpha > 0)
         if particle_enable_self_contact:
             self._recovery_locked_count = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -619,6 +632,15 @@ class SolverVBD(SolverBase):
             self._recovery_positions_buf = wp.zeros(
                 model.particle_count, dtype=wp.vec3, device=self.device
             )
+            # Gradient direction diagnostics
+            self._recovery_grad_dir_ok = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._recovery_grad_dir_total = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._recovery_new_pen_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            # Per-vertex diagnostics (indexed by recovery_applied_count)
+            self._recovery_vertex_ids = wp.zeros(model.particle_count, dtype=wp.int32, device=self.device)
+            self._recovery_d_before = wp.zeros(model.particle_count, dtype=float, device=self.device)
+            self._recovery_d_after = wp.zeros(model.particle_count, dtype=float, device=self.device)
+            self._recovery_dot_check = wp.zeros(model.particle_count, dtype=float, device=self.device)
 
         # Dynamic recoloring state (Stage 4): save original coloring for per-substep restore.
         if dynamic_recoloring and particle_enable_self_contact:
@@ -1215,6 +1237,29 @@ class SolverVBD(SolverBase):
                 dim=model.particle_count,
                 device=self.device,
             )
+
+            # Algorithm 3, step 4: apply Planar-DAT to the initial inertia guess.
+            # self.inertia holds the untruncated inertia positions (= X + ΔX_init).
+            # state_in.particle_q is overwritten with the truncated result.
+            if self.use_planar_dat and self.particle_enable_self_contact:
+                wp.launch(
+                    kernel=apply_planar_dat_to_all_kernel,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.pos_prev_collision_detection,
+                        self.inertia,
+                        model.particle_flags,
+                        model.tri_indices,
+                        model.edge_indices,
+                        self.particle_adjacency,
+                        self.trimesh_collision_detector.collision_info,
+                        self.planar_dat_gamma_r,
+                        1.5 * self.particle_self_contact_radius,
+                        self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                    ],
+                    outputs=[state_in.particle_q],
+                    device=self.device,
+                )
         else:
             wp.launch(
                 kernel=forward_step,
@@ -1684,6 +1729,11 @@ class SolverVBD(SolverBase):
                             self.particle_hessians,
                             self.pos_prev_collision_detection,
                             self.particle_conservative_bounds,
+                            self.use_planar_dat,
+                            self.trimesh_collision_detector.collision_info,
+                            self.planar_dat_gamma_r,
+                            1.5 * self.particle_self_contact_radius,
+                            self.trimesh_collision_detector.edge_edge_parallel_epsilon,
                         ],
                         outputs=[
                             state_out.particle_q,
@@ -1717,10 +1767,15 @@ class SolverVBD(SolverBase):
                             self.particle_hessians,
                             self.pos_prev_collision_detection,
                             self.particle_conservative_bounds,
+                            self.use_planar_dat,
+                            self.trimesh_collision_detector.collision_info,
+                            self.planar_dat_gamma_r,
+                            1.5 * self.particle_self_contact_radius,
+                            self.trimesh_collision_detector.edge_edge_parallel_epsilon,
                         ],
                         outputs=[
                             state_out.particle_q,
-                            self.stvk_forces    
+                            self.stvk_forces
                         ],
                         device=self.device,
                     )
@@ -1797,6 +1852,7 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
         # end color loop
+
         if not data_collector.is_log_nothing():
             data_collector.frame_timer.stop()
             total_force = (self.particle_forces + self.stvk_forces).numpy().reshape(-1, 3)
@@ -2204,6 +2260,19 @@ class SolverVBD(SolverBase):
             device=self.device,
         )
 
+        # Count vertices within tight proximity threshold (penetration indicator)
+        self._tight_pen_count.zero_()
+        wp.launch(
+            kernel=count_near_penetrations_kernel,
+            inputs=[
+                self.trimesh_collision_detector.collision_info,
+                self._tight_pen_threshold,
+            ],
+            outputs=[self._tight_pen_count],
+            dim=self.model.particle_count,
+            device=self.device,
+        )
+
         if self.enable_watchlist:
             self._run_watchlist_kernel(current_state)
 
@@ -2496,6 +2565,8 @@ class SolverVBD(SolverBase):
         particle_q without OGC clamping.
 
         Logs per-substep metrics to CSV if recovery_log_path was set.
+        Per-vertex diagnostics (d_before, d_after, dot_check) are written for the
+        first 100 substeps to a separate CSV.
         """
         import csv
         import os
@@ -2504,6 +2575,9 @@ class SolverVBD(SolverBase):
         self._recovery_applied_count.zero_()
         self._recovery_sum_pen.zero_()
         self._recovery_max_pen.zero_()
+        self._recovery_grad_dir_ok.zero_()
+        self._recovery_grad_dir_total.zero_()
+        self._recovery_new_pen_count.zero_()
 
         wp.launch(
             kernel=apply_locked_vertex_recovery_kernel,
@@ -2527,6 +2601,13 @@ class SolverVBD(SolverBase):
                 self._recovery_sum_pen,
                 self._recovery_max_pen,
                 self._recovery_positions_buf,
+                self._recovery_grad_dir_ok,
+                self._recovery_grad_dir_total,
+                self._recovery_new_pen_count,
+                self._recovery_vertex_ids,
+                self._recovery_d_before,
+                self._recovery_d_after,
+                self._recovery_dot_check,
             ],
             device=self.device,
         )
@@ -2536,10 +2617,25 @@ class SolverVBD(SolverBase):
         sum_pen = float(self._recovery_sum_pen.numpy()[0])
         max_pen = float(self._recovery_max_pen.numpy()[0])
         avg_pen = (sum_pen / applied) if applied > 0 else 0.0
+        grad_ok = int(self._recovery_grad_dir_ok.numpy()[0])
+        grad_total = int(self._recovery_grad_dir_total.numpy()[0])
+        new_pen = int(self._recovery_new_pen_count.numpy()[0])
+        grad_ratio = (grad_ok / grad_total) if grad_total > 0 else 0.0
+        tight_pen = int(self._tight_pen_count.numpy()[0])
 
         self._recovery_substep += 1
 
+        # Console output for first 5 substeps
+        if self._recovery_substep <= 5:
+            print(
+                f"[Recovery substep {self._recovery_substep:3d}] "
+                f"locked={locked:4d}  applied={applied:4d}  "
+                f"new_pen={new_pen:4d}  grad_dir_ratio={grad_ratio:.3f}  "
+                f"tight_pen={tight_pen:4d}"
+            )
+
         if self._recovery_log_path:
+            # Summary CSV
             csv_path = os.path.join(
                 self._recovery_log_path,
                 f"recovery_metrics_{self.recovery_alpha:.4f}.csv",
@@ -2550,12 +2646,39 @@ class SolverVBD(SolverBase):
                 if write_header:
                     writer.writerow(
                         ["substep", "locked_count", "recovery_applied",
-                         "avg_pen_depth", "max_pen_depth"]
+                         "avg_pen_depth", "max_pen_depth",
+                         "new_pen_count", "grad_dir_ratio", "tight_pen_count"]
                     )
                 writer.writerow(
                     [self._recovery_substep, locked, applied,
-                     f"{avg_pen:.6f}", f"{max_pen:.6f}"]
+                     f"{avg_pen:.6f}", f"{max_pen:.6f}",
+                     new_pen, f"{grad_ratio:.4f}", tight_pen]
                 )
+
+            # Per-vertex diagnostic CSV for first 100 substeps
+            if self._recovery_substep <= 100 and applied > 0:
+                n = min(applied, self.model.particle_count)
+                vids = self._recovery_vertex_ids.numpy()[:n]
+                d_bef = self._recovery_d_before.numpy()[:n]
+                d_aft = self._recovery_d_after.numpy()[:n]
+                dot_c = self._recovery_dot_check.numpy()[:n]
+
+                vdiag_path = os.path.join(
+                    self._recovery_log_path,
+                    f"recovery_vertex_diag_{self.recovery_alpha:.4f}.csv",
+                )
+                vwrite_header = not os.path.exists(vdiag_path)
+                with open(vdiag_path, "a", newline="") as vf:
+                    vwriter = csv.writer(vf)
+                    if vwrite_header:
+                        vwriter.writerow(
+                            ["substep", "vertex_id", "d_before", "d_after", "dot_grad_normal"]
+                        )
+                    for k in range(n):
+                        vwriter.writerow(
+                            [self._recovery_substep, int(vids[k]),
+                             f"{d_bef[k]:.6f}", f"{d_aft[k]:.6f}", f"{dot_c[k]:.4f}"]
+                        )
 
     def _launch_same_color_watchlist_barrier(self, current_state: State) -> None:
         """Launch accumulate_same_color_watchlist_barrier_kernel over all watchlist pairs.

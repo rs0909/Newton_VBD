@@ -32,7 +32,11 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import evaluate_body_particle_con
 
 from ...geometry import ParticleFlags
 from ...geometry.kernels import triangle_closest_point
-from .tri_mesh_collision import TriMeshCollisionInfo
+from .tri_mesh_collision import (
+    TriMeshCollisionInfo,
+    get_triangle_colliding_vertices_count,
+    get_triangle_colliding_vertices,
+)
 
 # TODO: Grab changes from Warp that has fixed the backward pass
 wp.set_module_options({"enable_backward": False})
@@ -1802,6 +1806,386 @@ def apply_conservative_bound_truncation(
         return pos_new
 
 
+@wp.func
+def planar_dat_vt_as_triangle_vertex(
+    x_v: wp.vec3,
+    dx_v: wp.vec3,
+    x_u: wp.vec3,
+    dx_u: wp.vec3,
+    x_a: wp.vec3,
+    x_b: wp.vec3,
+    x_c: wp.vec3,
+    dx_a: wp.vec3,
+    dx_b: wp.vec3,
+    dx_c: wp.vec3,
+    gamma_r: float,
+) -> float:
+    """Planar-DAT truncation ratio for triangle vertex v in pair (u, t=(a,b,c)).
+
+    Flying vertex u approaches triangle t.  v is one of {a, b, c} and must stay
+    on the triangle side of the shared division plane.  Implements the triangle-
+    side constraint from Algorithm 2 (Chen et al. 2025, arXiv:2604.15513).
+
+    Returns t in (0,1] such that the safe displacement for v is t*dx_v.
+    """
+    c_ut, _bary, _feat = triangle_closest_point(x_a, x_b, x_c, x_u)
+    diff = x_u - c_ut
+    dist = wp.length(diff)
+    if dist < float(1e-10):
+        return float(1.0)
+
+    n_ut = diff / dist  # from triangle toward u
+
+    delta_u = wp.max(-wp.dot(dx_u, n_ut), float(0.0))
+    if delta_u < float(1e-10):
+        return float(1.0)  # u not approaching triangle; no constraint
+
+    # Check whether v is moving toward u (in +n̂ direction)
+    approach_v = wp.dot(dx_v, n_ut)
+    if approach_v < float(1e-10):
+        return float(1.0)  # v not moving toward u
+
+    delta_t = wp.max(
+        wp.max(wp.max(wp.dot(dx_a, n_ut), wp.dot(dx_b, n_ut)), wp.dot(dx_c, n_ut)),
+        float(0.0),
+    )
+
+    if delta_t < float(1e-10):
+        # Triangle stationary: OGC isotropic fallback for v
+        dx_v_len = wp.length(dx_v)
+        if dx_v_len < float(1e-10):
+            return float(1.0)
+        t_ogc = float(0.5) * gamma_r * dist / dx_v_len
+        return wp.min(t_ogc, float(1.0))
+
+    lambda_val = delta_t / (delta_u + delta_t)
+    p_ut = x_u - lambda_val * (x_u - c_ut)  # division plane point
+
+    # v is on the triangle side: dot(x_v - p_ut, n_ut) < 0
+    # Safe as long as x_v + t*dx_v stays on triangle side.
+    t_num = wp.dot(p_ut - x_v, n_ut)
+    if t_num <= float(0.0):
+        return float(1.0)  # already past plane (degenerate); no constraint
+
+    t_i = t_num / approach_v
+    if t_i * gamma_r >= float(1.0):
+        return float(1.0)
+    return gamma_r * t_i
+
+
+@wp.func
+def planar_dat_vt_truncation_ratio(
+    x_v: wp.vec3,
+    x_a: wp.vec3,
+    x_b: wp.vec3,
+    x_c: wp.vec3,
+    dx_v: wp.vec3,
+    dx_a: wp.vec3,
+    dx_b: wp.vec3,
+    dx_c: wp.vec3,
+    gamma_r: float,
+) -> float:
+    """Planar-DAT truncation ratio for vertex v against triangle (a,b,c).
+
+    Uses substep-start geometry (x_*) and proposed/accumulated displacements (dx_*).
+    dx_v is the unconstrained displacement being truncated.
+    dx_a/b/c are the accumulated displacements of the triangle vertices.
+    Returns t in (0,1) such that the safe displacement is t*dx_v, or 1.0 if no
+    truncation is needed (vertex not approaching, or division plane beyond full step).
+    """
+    c_vt, _bary, _feat = triangle_closest_point(x_a, x_b, x_c, x_v)
+    diff = x_v - c_vt
+    dist = wp.length(diff)
+    if dist < float(1e-10):
+        return float(1.0)
+
+    n_vt = diff / dist
+
+    delta_v = wp.max(-wp.dot(dx_v, n_vt), float(0.0))
+    delta_t = wp.max(
+        wp.max(wp.max(wp.dot(dx_a, n_vt), wp.dot(dx_b, n_vt)), wp.dot(dx_c, n_vt)),
+        float(0.0),
+    )
+
+    if delta_v < float(1e-10):
+        return float(1.0)  # vertex not approaching triangle
+
+    if delta_t < float(1e-10):
+        # Triangle stationary: OGC isotropic fallback (d/2 bound)
+        dx_v_len = wp.length(dx_v)
+        if dx_v_len < float(1e-10):
+            return float(1.0)
+        t_ogc = float(0.5) * gamma_r * dist / dx_v_len
+        return wp.min(t_ogc, float(1.0))
+
+    lambda_val = delta_t / (delta_v + delta_t)
+
+    t_den = wp.dot(dx_v, n_vt)
+    if t_den >= -float(1e-10):
+        return float(1.0)  # v not approaching triangle
+
+    # dot(p_vt - x_v, n_vt) = -lambda * dist  (p_vt = x_v - lambda*(x_v-c_vt))
+    t_i = -lambda_val * dist / t_den
+
+    if t_i * gamma_r >= float(1.0):
+        return float(1.0)
+    return gamma_r * t_i
+
+
+@wp.func
+def planar_dat_ee_truncation_ratio_for_v(
+    x_e1v1: wp.vec3,
+    x_e1v2: wp.vec3,
+    x_e2v1: wp.vec3,
+    x_e2v2: wp.vec3,
+    dx_e1v1: wp.vec3,
+    dx_e1v2: wp.vec3,
+    dx_e2v1: wp.vec3,
+    dx_e2v2: wp.vec3,
+    v_order: int,
+    gamma_r: float,
+    ee_eps: float,
+) -> float:
+    """Planar-DAT truncation ratio for one vertex of an edge-edge pair.
+
+    v_order: 0 = e1v1, 1 = e1v2 (vertex v is always on the e1 side).
+    All positions are substep-start. dx for v is unconstrained; others accumulated.
+    Returns t in (0,1) or 1.0 if no truncation needed.
+    """
+    st = wp.closest_point_edge_edge(x_e1v1, x_e1v2, x_e2v1, x_e2v2, ee_eps)
+    s = st[0]
+    t = st[1]
+    dist = st[2]
+    if dist < float(1e-10):
+        return float(1.0)
+
+    c_e1 = x_e1v1 + s * (x_e1v2 - x_e1v1)
+    c_e2 = x_e2v1 + t * (x_e2v2 - x_e2v1)
+    n_ee = (c_e1 - c_e2) / dist  # points from e2 toward e1
+
+    dc_e1 = (float(1.0) - s) * dx_e1v1 + s * dx_e1v2
+    dc_e2 = (float(1.0) - t) * dx_e2v1 + t * dx_e2v2
+
+    delta_e1 = wp.max(-wp.dot(dc_e1, n_ee), float(0.0))  # e1 closing toward e2
+    delta_e2 = wp.max(wp.dot(dc_e2, n_ee), float(0.0))   # e2 closing toward e1
+
+    if v_order == 0:
+        x_v = x_e1v1
+        dx_v = dx_e1v1
+    else:
+        x_v = x_e1v2
+        dx_v = dx_e1v2
+
+    if delta_e1 < float(1e-10):
+        return float(1.0)  # e1 not closing toward e2
+
+    if delta_e2 < float(1e-10):
+        # e2 stationary: OGC isotropic fallback (d/2 bound)
+        dx_v_len = wp.length(dx_v)
+        if dx_v_len < float(1e-10):
+            return float(1.0)
+        t_ogc = float(0.5) * gamma_r * dist / dx_v_len
+        return wp.min(t_ogc, float(1.0))
+
+    lambda_ee = delta_e2 / (delta_e1 + delta_e2)
+    p_ee = c_e1 - lambda_ee * (c_e1 - c_e2)
+
+    t_den = wp.dot(dx_v, n_ee)
+    if t_den >= -float(1e-10):
+        return float(1.0)  # v not approaching the division plane
+
+    t_num = wp.dot(p_ee - x_v, n_ee)
+    t_i = t_num / t_den
+
+    if t_i <= float(0.0) or t_i * gamma_r >= float(1.0):
+        return float(1.0)
+    return gamma_r * t_i
+
+
+@wp.func
+def apply_planar_dat_bound(
+    particle_index: int,
+    particle_pos_new: wp.vec3,
+    pos_ref: wp.array(dtype=wp.vec3),
+    pos_cur: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    adjacency: ParticleForceElementAdjacencyInfo,
+    collision_info: TriMeshCollisionInfo,
+    gamma_r: float,
+    r_q: float,
+    ee_eps: float,
+) -> wp.vec3:
+    """Planar-DAT displacement bound for one vertex (Algorithm 2, Chen et al. 2025).
+
+    Implements both the flying-vertex constraint (v approaches triangle t) and the
+    triangle-vertex constraint (flying vertex u approaches a triangle containing v).
+    Per-pair truncation ratios are computed first; the global isotropic safety cap
+    (||Δx|| > 0.5*γ_r*r_q) is applied afterwards, matching Algorithm 2's ordering.
+
+    pos_ref = X0 (substep-start or collision-detection-start positions).
+    pos_cur = current positions (includes updates from earlier color groups).
+    particle_pos_new = proposed new position from Newton step.
+    """
+    x_v = pos_ref[particle_index]
+    dx_v = particle_pos_new - x_v
+    dx_v_len = wp.length(dx_v)
+
+    if dx_v_len < float(1e-10):
+        return particle_pos_new
+
+    t_v = float(1.0)
+
+    # --- VT: v as flying vertex approaching triangle t ---
+    n_vt_pairs = wp.min(
+        collision_info.vertex_colliding_triangles_count[particle_index],
+        collision_info.vertex_colliding_triangles_buffer_sizes[particle_index],
+    )
+    off_vt = collision_info.vertex_colliding_triangles_offsets[particle_index]
+
+    for k in range(n_vt_pairs):
+        tri_idx = collision_info.vertex_colliding_triangles[2 * (off_vt + k) + 1]
+        if tri_idx < 0:
+            continue
+        ia = tri_indices[tri_idx, 0]
+        ib = tri_indices[tri_idx, 1]
+        ic = tri_indices[tri_idx, 2]
+
+        x_a = pos_ref[ia]
+        x_b = pos_ref[ib]
+        x_c = pos_ref[ic]
+        dx_a = pos_cur[ia] - x_a
+        dx_b = pos_cur[ib] - x_b
+        dx_c = pos_cur[ic] - x_c
+
+        t_pair = planar_dat_vt_truncation_ratio(
+            x_v, x_a, x_b, x_c, dx_v, dx_a, dx_b, dx_c, gamma_r
+        )
+        t_v = wp.min(t_v, t_pair)
+
+    # --- VT: v as triangle vertex; flying vertex u approaches adjacent triangle ---
+    # Iterates over adjacent triangles of v; for each, checks approaching vertices.
+    # Constrains v to stay on the triangle side of the shared division plane.
+    n_adj_tris = get_vertex_num_adjacent_faces(adjacency, particle_index)
+    for i_adj_tri in range(n_adj_tris):
+        t_adj_idx, _v_order = get_vertex_adjacent_face_id_order(adjacency, particle_index, i_adj_tri)
+        n_approaching = get_triangle_colliding_vertices_count(collision_info, t_adj_idx)
+        if n_approaching == 0:
+            continue
+        ia = tri_indices[t_adj_idx, 0]
+        ib = tri_indices[t_adj_idx, 1]
+        ic = tri_indices[t_adj_idx, 2]
+        x_a = pos_ref[ia]
+        x_b = pos_ref[ib]
+        x_c = pos_ref[ic]
+        dx_a = pos_cur[ia] - x_a
+        dx_b = pos_cur[ib] - x_b
+        dx_c = pos_cur[ic] - x_c
+
+        for k_u in range(n_approaching):
+            u_idx = get_triangle_colliding_vertices(collision_info, t_adj_idx, k_u)
+            if u_idx == particle_index:
+                continue
+            x_u = pos_ref[u_idx]
+            dx_u = pos_cur[u_idx] - x_u
+            t_pair = planar_dat_vt_as_triangle_vertex(
+                x_v, dx_v, x_u, dx_u, x_a, x_b, x_c, dx_a, dx_b, dx_c, gamma_r
+            )
+            t_v = wp.min(t_v, t_pair)
+
+    # --- EE: v on edge e1, ec is the colliding edge (e2) ---
+    n_adj_edges = get_vertex_num_adjacent_edges(adjacency, particle_index)
+    for i_adj in range(n_adj_edges):
+        e, v_order_on_e = get_vertex_adjacent_edge_id_order(adjacency, particle_index, i_adj)
+        if v_order_on_e < 2:
+            continue
+
+        e_v1 = edge_indices[e, 2]
+        e_v2 = edge_indices[e, 3]
+        v_order_in_pair = v_order_on_e - 2
+
+        n_ee_pairs = wp.min(
+            collision_info.edge_colliding_edges_count[e],
+            collision_info.edge_colliding_edges_buffer_sizes[e],
+        )
+        off_ee = collision_info.edge_colliding_edges_offsets[e]
+
+        for k_ee in range(n_ee_pairs):
+            ec = collision_info.edge_colliding_edges[2 * (off_ee + k_ee) + 1]
+            if ec < 0:
+                continue
+            ec_v1 = edge_indices[ec, 2]
+            ec_v2 = edge_indices[ec, 3]
+
+            x_e1v1 = pos_ref[e_v1]
+            x_e1v2 = pos_ref[e_v2]
+            x_e2v1 = pos_ref[ec_v1]
+            x_e2v2 = pos_ref[ec_v2]
+
+            if v_order_in_pair == 0:
+                dx_e1v1 = dx_v
+                dx_e1v2 = pos_cur[e_v2] - pos_ref[e_v2]
+            else:
+                dx_e1v1 = pos_cur[e_v1] - pos_ref[e_v1]
+                dx_e1v2 = dx_v
+
+            dx_e2v1 = pos_cur[ec_v1] - pos_ref[ec_v1]
+            dx_e2v2 = pos_cur[ec_v2] - pos_ref[ec_v2]
+
+            t_pair = planar_dat_ee_truncation_ratio_for_v(
+                x_e1v1, x_e1v2, x_e2v1, x_e2v2,
+                dx_e1v1, dx_e1v2, dx_e2v1, dx_e2v2,
+                v_order_in_pair, gamma_r, ee_eps,
+            )
+            t_v = wp.min(t_v, t_pair)
+
+    # Apply per-pair truncation first, then global isotropic safety cap (Algorithm 2 order).
+    new_dx = t_v * dx_v
+    new_dx_len = wp.length(new_dx)
+    isotropic_cap = float(0.5) * gamma_r * r_q
+    if new_dx_len > isotropic_cap:
+        new_dx = (isotropic_cap / new_dx_len) * new_dx
+
+    return x_v + new_dx
+
+
+@wp.kernel
+def apply_planar_dat_to_all_kernel(
+    pos_ref: wp.array(dtype=wp.vec3),
+    pos_cur: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    edge_indices: wp.array(dtype=wp.int32, ndim=2),
+    adjacency: ParticleForceElementAdjacencyInfo,
+    collision_info: TriMeshCollisionInfo,
+    gamma_r: float,
+    r_q: float,
+    ee_eps: float,
+    pos_out: wp.array(dtype=wp.vec3),
+):
+    """Apply Planar-DAT (Algorithm 2) to all active vertices in one pass.
+
+    Reads pos_cur as the proposed positions (e.g. inertia guess or post-sweep
+    positions) and writes DAT-truncated positions to pos_out.  Using a separate
+    output buffer avoids CUDA write races when triangle vertices are updated by
+    flying-vertex pairs processed in parallel.
+
+    Used for:
+      - Algorithm 3 step 4: truncate the initial inertia guess before iterations.
+    """
+    v = wp.tid()
+
+    if not (particle_flags[v] & ParticleFlags.ACTIVE):
+        pos_out[v] = pos_cur[v]
+        return
+
+    pos_out[v] = apply_planar_dat_bound(
+        v, pos_cur[v], pos_ref, pos_cur,
+        tri_indices, edge_indices, adjacency,
+        collision_info, gamma_r, r_q, ee_eps,
+    )
+
+
 @wp.kernel
 def solve_trimesh_no_self_contact_tile(
     dt: float,
@@ -3044,6 +3428,11 @@ def solve_trimesh_with_self_contact_penetration_free(
     particle_hessians: wp.array(dtype=wp.mat33),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
     particle_conservative_bounds: wp.array(dtype=float),
+    use_planar_dat: bool,
+    collision_info: TriMeshCollisionInfo,
+    gamma_r: float,
+    r_q: float,
+    ee_eps: float,
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -3142,9 +3531,17 @@ def solve_trimesh_with_self_contact_penetration_free(
         h_inv = wp.inverse(h)
         particle_pos_new = pos[particle_index] + h_inv * f
 
-        pos_new[particle_index] = apply_conservative_bound_truncation(
-            particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
-        )
+        if use_planar_dat:
+            pos_new[particle_index] = apply_planar_dat_bound(
+                particle_index, particle_pos_new,
+                pos_prev_collision_detection, pos,
+                tri_indices, edge_indices, adjacency,
+                collision_info, gamma_r, r_q, ee_eps,
+            )
+        else:
+            pos_new[particle_index] = apply_conservative_bound_truncation(
+                particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
+            )
 
 
 @wp.kernel
@@ -3170,6 +3567,11 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
     particle_hessians: wp.array(dtype=wp.mat33),
     pos_prev_collision_detection: wp.array(dtype=wp.vec3),
     particle_conservative_bounds: wp.array(dtype=float),
+    use_planar_dat: bool,
+    collision_info: TriMeshCollisionInfo,
+    gamma_r: float,
+    r_q: float,
+    ee_eps: float,
     # output
     pos_new: wp.array(dtype=wp.vec3),
     stvk_forces: wp.array(dtype=wp.vec3)
@@ -3284,9 +3686,17 @@ def solve_trimesh_with_self_contact_penetration_free_tile(
             )
             particle_pos_new = particle_pos + h_inv * f_total
 
-            pos_new[particle_index] = apply_conservative_bound_truncation(
-                particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
-            )
+            if use_planar_dat:
+                pos_new[particle_index] = apply_planar_dat_bound(
+                    particle_index, particle_pos_new,
+                    pos_prev_collision_detection, pos,
+                    tri_indices, edge_indices, adjacency,
+                    collision_info, gamma_r, r_q, ee_eps,
+                )
+            else:
+                pos_new[particle_index] = apply_conservative_bound_truncation(
+                    particle_index, particle_pos_new, pos_prev_collision_detection, particle_conservative_bounds
+                )
 
 
 @wp.kernel
@@ -3465,12 +3875,21 @@ def apply_locked_vertex_recovery_kernel(
     contact_radius: float,
     stiffness: float,
     recovery_positions_max: int,
-    # outputs
+    # outputs - aggregate scalars
     recovery_count: wp.array(dtype=wp.int32),
     locked_count: wp.array(dtype=wp.int32),
     sum_pen_depth: wp.array(dtype=float),
     max_pen_depth: wp.array(dtype=float),
     recovery_positions: wp.array(dtype=wp.vec3),
+    # outputs - gradient direction diagnostics
+    grad_dir_ok_count: wp.array(dtype=wp.int32),
+    grad_dir_total_count: wp.array(dtype=wp.int32),
+    new_pen_count: wp.array(dtype=wp.int32),
+    # outputs - per-vertex diagnostics (indexed by recovery_count)
+    recovery_vertex_ids: wp.array(dtype=wp.int32),
+    recovery_d_before: wp.array(dtype=float),
+    recovery_d_after: wp.array(dtype=float),
+    recovery_dot_check: wp.array(dtype=float),
 ):
     """Apply escape gradient to locked vertices, bypassing OGC truncation.
 
@@ -3479,8 +3898,8 @@ def apply_locked_vertex_recovery_kernel(
     each near-contact pair (dis < contact_radius). The gradient is applied directly
     to particle_q without OGC clamping.
 
-    alpha scales the step size. Metrics (locked_count, recovery_count,
-    sum/max penetration depth) are accumulated atomically for CSV logging.
+    Pass 1: accumulate gradient, track d_before_min and direction.
+    Pass 2: after applying new_pos, measure d_after_min and new penetrations.
     """
     i = wp.tid()
 
@@ -3490,7 +3909,6 @@ def apply_locked_vertex_recovery_kernel(
         return
 
     bound = particle_conservative_bounds[i]
-
     if bound >= epsilon:
         return
 
@@ -3505,7 +3923,10 @@ def apply_locked_vertex_recovery_kernel(
 
     g = wp.vec3(0.0, 0.0, 0.0)
     n_pairs = int(0)
+    d_before_min = float(1e10)
+    nearest_escape_normal = wp.vec3(1.0, 0.0, 0.0)
 
+    # Pass 1: accumulate escape gradient and record d_before / gradient direction
     for k in range(count_i):
         tri_idx = collision_info.vertex_colliding_triangles[2 * (off_i + k) + 1]
         if tri_idx < 0:
@@ -3519,6 +3940,11 @@ def apply_locked_vertex_recovery_kernel(
         diff = pos_i - closest_p
         dis = wp.length(diff)
 
+        if dis < d_before_min:
+            d_before_min = dis
+            if dis > 1e-6:
+                nearest_escape_normal = diff / dis
+
         if dis < 1e-6 or dis >= contact_radius:
             continue
 
@@ -3531,12 +3957,53 @@ def apply_locked_vertex_recovery_kernel(
         wp.atomic_add(sum_pen_depth, 0, pen_depth)
         wp.atomic_max(max_pen_depth, 0, pen_depth)
 
+        wp.atomic_add(grad_dir_total_count, 0, 1)
+        if wp.dot(f_escape, escape_normal) > 0.0:
+            wp.atomic_add(grad_dir_ok_count, 0, 1)
+
         g = g + f_escape
         n_pairs += 1
 
-    if n_pairs > 0:
-        new_pos = pos_i + alpha * g
-        particle_q[i] = new_pos
-        idx = wp.atomic_add(recovery_count, 0, 1)
-        if idx < recovery_positions_max:
-            recovery_positions[idx] = new_pos
+    if n_pairs == 0:
+        return
+
+    new_pos = pos_i + alpha * g
+    particle_q[i] = new_pos
+
+    # Pass 2: measure d_after and detect new penetrations introduced by this step
+    d_after_min = float(1e10)
+    for k in range(count_i):
+        tri_idx = collision_info.vertex_colliding_triangles[2 * (off_i + k) + 1]
+        if tri_idx < 0:
+            continue
+
+        a = particle_q[tri_indices[tri_idx, 0]]
+        b = particle_q[tri_indices[tri_idx, 1]]
+        c = particle_q[tri_indices[tri_idx, 2]]
+
+        closest_before, _bb, _fb = triangle_closest_point(a, b, c, pos_i)
+        dis_before = wp.length(pos_i - closest_before)
+
+        closest_after, _ba, _fa = triangle_closest_point(a, b, c, new_pos)
+        dis_after = wp.length(new_pos - closest_after)
+
+        if dis_after < d_after_min:
+            d_after_min = dis_after
+
+        # new penetration: safe before, penetrating after
+        if dis_before >= contact_radius and dis_after < contact_radius:
+            wp.atomic_add(new_pen_count, 0, 1)
+
+    g_len = wp.length(g)
+    if g_len > 1e-10:
+        dot_check = wp.dot(g / g_len, nearest_escape_normal)
+    else:
+        dot_check = float(0.0)
+
+    idx = wp.atomic_add(recovery_count, 0, 1)
+    if idx < recovery_positions_max:
+        recovery_positions[idx] = new_pos
+        recovery_vertex_ids[idx] = i
+        recovery_d_before[idx] = d_before_min
+        recovery_d_after[idx] = d_after_min
+        recovery_dot_check[idx] = dot_check
