@@ -183,13 +183,17 @@ class Example:
         # vertex[i*50+j], column j=49 is the last column (max original-X).
         cloth_size = 50
         top_side = [cloth_size - 1 + i * cloth_size for i in range(cloth_size)]
+        # Bottom edge (j=0): only the two corner vertices (i=0 and i=49) are
+        # kinematically controlled and rotate in the opposite direction.
+        bottom_corners = [0, (cloth_size - 1) * cloth_size]
 
-        # Fix top edge; bottom edge is always free (ACTIVE by default).
+        # Fix top edge + bottom corners initially.
         flags = self.model.particle_flags.numpy()
-        for idx in top_side:
+        for idx in top_side + bottom_corners:
             flags[idx] = flags[idx] & ~ParticleFlags.ACTIVE
         self.model.particle_flags = wp.array(flags)
         self.top_side = top_side
+        self.bottom_corners = bottom_corners
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
@@ -215,12 +219,13 @@ class Example:
         self.collision_pipeline = newton.examples.create_collision_pipeline(self.model, args)
         self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
 
-        # All top-edge vertices rotate around the Y-axis (vertical) uniformly.
-        rot_axes = [[0, 1, 0]] * len(top_side)
+        # Top edge: +Y rotation; bottom corners: -Y rotation (opposite direction).
+        rot_point_indices = top_side + bottom_corners
+        rot_axes = [[0, 1, 0]] * len(top_side) + [[0, -1, 0]] * len(bottom_corners)
 
-        self.rot_point_indices = wp.array(top_side, dtype=int)
+        self.rot_point_indices = wp.array(rot_point_indices, dtype=int)
         self.t = wp.zeros((1,), dtype=float)
-        self.rot_centers = wp.zeros(len(top_side), dtype=wp.vec3)
+        self.rot_centers = wp.zeros(len(rot_point_indices), dtype=wp.vec3)
         self.rot_axes = wp.array(rot_axes, dtype=wp.vec3)
         self.roots = wp.zeros_like(self.rot_centers)
         self.roots_to_ps = wp.zeros_like(self.rot_centers)
@@ -273,11 +278,11 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        # At rot_end_time release the top edge so the cloth can untwist freely.
+        # At rot_end_time release only the bottom corners; top stays fixed.
         if not self.released and self.sim_time >= self.rot_end_time:
             self.released = True
             flags = self.model.particle_flags.numpy()
-            for idx in self.top_side:
+            for idx in self.bottom_corners:
                 flags[idx] = flags[idx] | int(ParticleFlags.ACTIVE)
             self.model.particle_flags = wp.array(flags, device=wp.get_device())
 
