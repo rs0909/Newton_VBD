@@ -18,9 +18,9 @@
 #
 # A square cloth hangs vertically under gravity.  Only the top edge is
 # kinematically controlled: it is twisted 6 full rotations over 10 s and
-# then released.  The bottom edge is free throughout.  After release the
-# cloth untwists naturally under gravity and elastic restoring forces while
-# Planar-DAT keeps it intersection-free.
+# then stopped.  The bottom edge is free throughout.  After the twist stops
+# the cloth untwists naturally under gravity and elastic restoring forces
+# while Planar-DAT (Algorithm 2 & 3) keeps it intersection-free.
 #
 # Command: python -m newton.examples cloth_twist_relase
 #
@@ -156,11 +156,15 @@ class Example:
         # Gravity on so the cloth hangs vertically.
         scene = newton.ModelBuilder(gravity=-9.8)
         scene.add_cloth_mesh(
-            # rot=90 deg around Z maps the XZ-plane cloth into the YZ plane
-            # (original X -> Y), so the cloth spans Y in [-0.25, +0.25].
-            # Shift +0.25 m in Y so the top sits near +0.50 m and bottom near 0.
+            # Two-step rotation so the cloth hangs in the XY plane (front-facing):
+            #   1. quat(Z, 90°): XZ-plane mesh → YZ plane (X→Y, j=49 becomes top)
+            #   2. quat(Y, 90°): YZ plane → XY plane (Z→X, cloth width goes left-right)
+            # Net: j=49 at Y≈+1.0 m (top), j=0 at Y≈-0.5 m (bottom), cloth at Z=0.
             pos=wp.vec3(0.0, 0.25, 0.0),
-            rot=wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2),
+            rot=(
+                wp.quat_from_axis_angle(wp.vec3(0, 1, 0), np.pi / 2)
+                * wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2)
+            ),
             scale=0.01,
             vertices=vertices,
             indices=mesh_indices,
@@ -183,7 +187,7 @@ class Example:
         # vertex[i*50+j], column j=49 is the last column (max original-X).
         cloth_size = 50
         top_side = [cloth_size - 1 + i * cloth_size for i in range(cloth_size)]
-        # Bottom edge (j=0): only the two corner vertices (i=0 and i=49) are
+        # Bottom edge j=0: only the two corner vertices (i=0 and i=49) are
         # kinematically controlled and rotate in the opposite direction.
         bottom_corners = [0, (cloth_size - 1) * cloth_size]
 
