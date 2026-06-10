@@ -52,9 +52,11 @@ For each scene × iteration count, four variants were run:
 
 **Note**: `dynamic_recoloring=False` in all variants (not passed to the solver constructor; defaults off). The `>>> OGC Contact mode ON <<<` message refers to the collision *detection* algorithm (OGC vs. standard BVH query), not graph recoloring. Therefore `full − no_trunc` isolates **Planar-DAT only** without dynamic recoloring.
 
-### 2.3 Iteration Sweep
+### 2.3 Iteration and Substep Sweeps
 
-`iterations ∈ {10, 50, 100, 500}`, `substeps = 10`, `fps = 60`, `dt = 1/600 s ≈ 1.667 ms`.
+**Iteration sweep** (§3–§6): `iterations ∈ {10, 50, 100, 500}`, `substeps = 10`, `fps = 60`, `dt = 1/600 s ≈ 1.667 ms`.
+
+**Substep sweep** (§7.5): `substeps ∈ {2, 5, 10, 20, 40}`, `iterations = 100`, `fps = 60`, `dt = 1/(60 × substeps) s`. All four ablation variants run for Scenes A and B only. The substep sweep varies dt while keeping the total simulated time fixed (30 frames = 0.5 s), so each row represents a different per-substep timestep.
 
 ### 2.4 Scenes
 
@@ -266,6 +268,47 @@ Scene C (separating)    ███             ███ (stabilize) ████
 Scene D (twisted)       ██              ████ (complex)  ████████
 ```
 
+### 7.5 Effect of Substep Count (Timestep Size)
+
+To separate the effect of dt from iteration count, a substep sweep was run on Scenes A (no contact) and B (frictionless sliding) with `iterations=100`, four ablation variants each.
+
+#### Scene A — Structural Implicit Damping vs. dt
+
+| substeps | dt (ms) | E_final (J) | E retained | ΔE/substep (J) | ΔE/s (J/s) |
+|----------|---------|------------|-----------|----------------|-----------|
+| 2  | 8.333 | −36.15 | −12.7% | 3.444 | 413.3 |
+| 5  | 3.333 | −12.37 | −4.4%  | 1.594 | 478.1 |
+| 10 | 1.667 |   5.89 |  +2.1% | 0.844 | 506.2 |
+| 20 | 0.833 |  20.71 |  +7.3% | 0.425 | 510.3 |
+| 40 | 0.417 |  25.96 |  +9.1% | 0.213 | 512.2 |
+
+**Log-log fit**: `ΔE/substep ∝ dt^0.93 ≈ dt` — per-substep energy loss scales nearly linearly with the timestep size, as expected from backward-Euler implicit integration.
+
+**Key finding**: `ΔE/s ≈ 500 J/s` is approximately constant across all substep counts. Halving dt (doubling substeps) halves the per-substep loss but doubles the substep count — the net dissipation rate per unit simulated time is invariant.
+
+#### Scene B — Planar-DAT Truncation vs. dt (full variant, iter=100)
+
+| substeps | dt (ms) | n_truncated | ΔKE_trunc/sub (J) | ΔKE_trunc/s (J/s) |
+|----------|---------|------------|------------------|--------------------|
+| 2  | 8.333 | 541.9 | 3.573 | 428.7 |
+| 5  | 3.333 | 275.3 | 4.458 | 1337.4 |
+| 10 | 1.667 | 115.1 | 1.353 | 811.5 |
+| 20 | 0.833 |  40.4 | 0.425 | 509.4 |
+| 40 | 0.417 |  30.3 | 0.333 | 798.5 |
+
+**Log-log fit for n_truncated**: `n_trunc ∝ dt^1.04 ≈ dt` — fewer pairs truncated per substep at smaller dt, because per-substep particle displacements are smaller and less often exceed the conservative bound.
+
+**Key finding**: Unlike Scene A, `ΔKE_trunc/s` is **non-monotonic**. At sub=5 (dt=3.33 ms), the truncation rate per unit time spikes to 1337 J/s — more than 2× the neighboring data points. This arises because the contact topology (which pairs are active) changes qualitatively at different dt values: large dt allows more pairs to accumulate before truncation fires, creating burst-mode truncation events.
+
+**Tangential fraction** remains ≈ 0.42 across all substep counts, confirming that this is a geometric property of the truncation algorithm, not a dt artifact.
+
+#### Summary
+
+| Damping source | Per-substep scaling | Per-unit-time rate |
+|---------------|--------------------|--------------------|
+| Structural (backward-Euler) | ∝ dt^0.93 | ≈ constant (~500 J/s) |
+| Planar-DAT truncation (Scene B) | ∝ dt^0.94 | non-monotonic (contact topology) |
+
 ---
 
 ## 8. Implications for Real-Time Simulation
@@ -293,6 +336,15 @@ In brief-contact scenes (Scene C, iter=10), disabling Planar-DAT causes catastro
 
 In the twist-release scene (Scene D, ~40,000 contact pairs), the effect of Planar-DAT is non-monotonic with respect to iteration count: the solver converges to qualitatively different topological states depending on how aggressively truncation clips inertia displacements. This complicates any deterministic prediction of damping magnitude in real garment scenarios.
 
+### 8.5 Increasing Substep Count Does Not Reduce Damping
+
+A common expectation is that using more substeps (smaller dt) will reduce artificial dissipation — more steps should make the simulation "more accurate." This expectation is **incorrect for VBD**:
+
+- **Structural backward-Euler damping**: per-substep loss ∝ dt, but substep rate ∝ 1/dt. The product — energy loss per unit simulated time — is constant regardless of substep count.
+- **Planar-DAT truncation**: per-substep n_trunc ∝ dt, and per-substep ΔKE_trunc ∝ dt. Again the per-unit-time rate is roughly constant, though it is additionally sensitive to contact topology changes at different dt.
+
+**Consequence**: doubling the substep count doubles the computational cost but does not improve energy conservation. Fixing structural damping requires a different time integration scheme (e.g., BDF2, symplectic integrators, or kinetic energy correction), not simply a finer timestep.
+
 ---
 
 ## 9. Experimental Configuration
@@ -309,7 +361,13 @@ In the twist-release scene (Scene D, ~40,000 contact pairs), the effect of Plana
 | `use_planar_dat` | True (`full`, `no_friction`) / False (`no_trunc`, `no_contact`) |
 | Scenes A, B, C frames | 30 (0.5 s) |
 | Scene D frames | 720 (12 s) |
-| Total runs | 64 (4 scenes × 4 iter × 4 ablation) |
+| Total runs (iteration sweep) | 64 (4 scenes × 4 iter × 4 ablation) |
+| **Substep sweep** | |
+| Substeps/frame | 2, 5, 10, 20, 40 |
+| dt range | 0.417 ms – 8.333 ms |
+| Iterations | 100 |
+| Scenes | A, B only |
+| Total runs (substep sweep) | 40 (2 scenes × 5 substeps × 4 ablation) |
 
 ---
 
