@@ -1,0 +1,32 @@
+/data4t/vbd-step1/newton/_src/sim/graph_coloring.py:186: UserWarning: Color balancing terminated early: max/min ratio 1.174 exceeds target 1.100. The graph may not be further optimizable.
+  color_groups = color_graph(num_nodes, graph_edge_indices, balance_colors, target_max_min_color_ratio, algorithm)
+Warp 1.11.0.dev20251205 initialized:
+   Git commit: 6dc700bf80f89f8a8445bc2378cea313cb39ecea
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (24 GiB, sm_89, mempool enabled)
+     "cuda:1"   : "NVIDIA GeForce RTX 4090" (24 GiB, sm_89, mempool enabled)
+   CUDA peer access:
+     Not supported
+   Kernel cache:
+     /home/ps4/.cache/warp/1.11.0.dev20251205
+Module newton._src.sim.graph_coloring 7b39b1d load on device 'cpu' took 1.62 ms  (cached)
+Module newton._src.solvers.vbd.particle_vbd_kernels c04bff7 load on device 'cpu' took 0.28 ms  (cached)
+[watchlist] R_recolor=0.2000m  R_watchlist=0.4000m  d_hat=0.2000m
+Module newton._src.geometry.narrow_phase f5e09bb load on device 'cuda:1' took 2.74 ms  (cached)
+Module newton._src.geometry.narrow_phase d368c20 load on device 'cuda:1' took 2.67 ms  (cached)
+Module newton._src.geometry.narrow_phase 6b4a09b load on device 'cuda:1' took 2.67 ms  (cached)
+Module newton._src.geometry.contact_reduction_global c502db6 load on device 'cuda:1' took 1.41 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 9ec9414 load on device 'cuda:1' took 1.82 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 43d34bf load on device 'cuda:1' took 2.39 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 699c8ba load on device 'cuda:1' took 1.93 ms  (cached)
+Module newton._src.solvers.vbd.particle_vbd_kernels b4fc113 load on device 'cuda:1' took 9.41 ms  (cached)
+Module newton._src.solvers.vbd.particle_vbd_kernels fbcd6f1 load on device 'cuda:1' took 2.89 ms  (cached)
+Module map_add a09258f load on device 'cuda:1' took 0.58 ms  (cached)
+
+In log_state, there are 0 shape instances.
+- triangles
+- particles
+
+[VBDDiagnostics] saved 1200 step-records, 0 trunc-records, 0 iter-records → output/A.npz

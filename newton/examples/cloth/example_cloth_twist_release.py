@@ -14,15 +14,13 @@
 # limitations under the License.
 
 ###########################################################################
-# Example Cloth Twist Release (Figure 10, Chen et al. 2025 arXiv:2604.15513)
+# Example Cloth Twist
 #
-# A square cloth hangs vertically under gravity.  Only the top edge is
-# kinematically controlled: it is twisted 6 full rotations over 10 s and
-# then stopped.  The bottom edge is free throughout.  After the twist stops
-# the cloth untwists naturally under gravity and elastic restoring forces
-# while Planar-DAT (Algorithm 2 & 3) keeps it intersection-free.
+# This simulation demonstrates twisting an FEM cloth model using the VBD
+# solver, showcasing its ability to handle complex self-contacts while
+# ensuring it remains intersection-free.
 #
-# Command: python -m newton.examples cloth_twist_relase
+# Command: python -m newton.examples cloth_twist
 #
 ###########################################################################
 
@@ -39,6 +37,8 @@ import newton.examples
 import newton.usd
 from newton import ParticleFlags
 
+from .example_cloth_smpl_1layer0 import (debug_contact_points, check_particle_valid)
+
 
 @wp.kernel
 def initialize_rotation(
@@ -53,7 +53,7 @@ def initialize_rotation(
     roots_to_ps: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
-    v_index = vertex_indices_to_rot[tid]
+    v_index = vertex_indices_to_rot[wp.tid()]
 
     p = pos[v_index]
     rot_center = rot_centers[tid]
@@ -61,6 +61,7 @@ def initialize_rotation(
     op = p - rot_center
 
     root = wp.dot(op, rot_axis) * rot_axis
+
     root_to_p = p - root
 
     roots[tid] = root
@@ -71,7 +72,7 @@ def initialize_rotation(
 
 
 @wp.kernel
-def apply_top_rotation(
+def apply_rotation(
     # input
     vertex_indices_to_rot: wp.array(dtype=wp.int32),
     rot_axes: wp.array(dtype=wp.vec3),
@@ -85,15 +86,15 @@ def apply_top_rotation(
     pos_0: wp.array(dtype=wp.vec3),
     pos_1: wp.array(dtype=wp.vec3),
 ):
-    """Kinematically rotate top-edge vertices around Y; stop at end_time."""
     cur_t = t[0]
     if cur_t >= end_time:
         return
 
     tid = wp.tid()
-    v_index = vertex_indices_to_rot[tid]
+    v_index = vertex_indices_to_rot[wp.tid()]
 
     rot_axis = rot_axes[tid]
+
     ux = rot_axis[0]
     uy = rot_axis[1]
     uz = rot_axis[2]
@@ -126,21 +127,25 @@ def apply_top_rotation(
 
 class Example:
     def __init__(self, viewer, args=None):
+        # setup simulation parameters first
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
 
+        # group related attributes by prefix
         self.sim_time = 0.0
-        self.sim_substeps = 10
+        self.sim_substeps = 10  # must be an even number when using CUDA Graph
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.iterations = 10
+        # the BVH used by SolverVBD will be rebuilt every self.bvh_rebuild_frames
+        # When the simulated object deforms significantly, simply refitting the BVH can lead to deterioration of the BVH's
+        # quality, in this case we need to completely rebuild the tree to achieve better query efficiency.
         self.bvh_rebuild_frames = 10
 
-        # 6 full rotations in 10 s (paper Fig. 10)
-        self.rot_angular_velocity = 6.0 * 2.0 * math.pi / 10.0
-        self.rot_end_time = 10.0
-        self.released = False
+        self.rot_angular_velocity = math.pi / 3
+        self.rot_end_time = 10
 
+        # save a reference to the viewer
         self.viewer = viewer
 
         usd_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "square_cloth.usd"))
@@ -153,18 +158,10 @@ class Example:
         vertices = [wp.vec3(v) for v in mesh_points]
         self.faces = mesh_indices.reshape(-1, 3)
 
-        # Gravity on so the cloth hangs vertically.
-        scene = newton.ModelBuilder(gravity=-9.8)
+        scene = newton.ModelBuilder(gravity=0)
         scene.add_cloth_mesh(
-            # Two-step rotation so the cloth hangs in the XY plane (front-facing):
-            #   1. quat(Z, 90°): XZ-plane mesh → YZ plane (X→Y, j=49 becomes top)
-            #   2. quat(Y, 90°): YZ plane → XY plane (Z→X, cloth width goes left-right)
-            # Net: j=49 at Y≈+1.0 m (top), j=0 at Y≈-0.5 m (bottom), cloth at Z=0.
-            pos=wp.vec3(0.0, 0.25, 0.0),
-            rot=(
-                wp.quat_from_axis_angle(wp.vec3(0, 1, 0), np.pi / 2)
-                * wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2)
-            ),
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2),
             scale=0.01,
             vertices=vertices,
             indices=mesh_indices,
@@ -182,55 +179,59 @@ class Example:
         self.model.soft_contact_kd = 1.0e-4
         self.model.soft_contact_mu = 0.2
 
-        # After rot=90 deg around Z, the column with the largest original-X
-        # becomes the top edge (max Y).  In the 50x50 grid indexed as
-        # vertex[i*50+j], column j=49 is the last column (max original-X).
         cloth_size = 50
-        top_side = [cloth_size - 1 + i * cloth_size for i in range(cloth_size)]
-        # Bottom edge j=0: only the two corner vertices (i=0 and i=49) are
-        # kinematically controlled and rotate in the opposite direction.
-        bottom_corners = [0, (cloth_size - 1) * cloth_size]
+        top_side    = [cloth_size**2-1-i for i in range(cloth_size)]
+        bottom_side = [i for i in range(cloth_size)]
+        rot_point_indices = top_side + bottom_side
 
-        # Fix top edge + bottom corners initially.
-        flags = self.model.particle_flags.numpy()
-        for idx in top_side + bottom_corners:
-            flags[idx] = flags[idx] & ~ParticleFlags.ACTIVE
-        self.model.particle_flags = wp.array(flags)
         self.top_side = top_side
-        self.bottom_corners = bottom_corners
+        self.bottom_side = bottom_side
+        self.released = False
 
+        flags = self.model.particle_flags.numpy()
+        for fixed_vertex_id in rot_point_indices:
+            flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
+        self.model.particle_flags = wp.array(flags)
+
+        # Solver configured to run paper-only (arXiv:2604.15513) Planar-DAT.
+        # Extra mechanisms (watchlist barrier, dynamic recoloring, same-color barrier,
+        # locked-vertex recovery) are turned OFF so that only Algorithm 2 + 3 of the
+        # paper are active.  To re-enable extras, set the corresponding flags/values.
         self.solver = newton.solvers.SolverVBD(
             self.model,
             self.iterations,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
-            particle_self_contact_margin=0.0035,
-            ogc_contact=True,
-            # Paper (arXiv:2604.15513) Algorithm 2 & 3
+            particle_self_contact_margin=0.003,
+            ogc_contact=False,
+            # --- Paper (arXiv:2604.15513) Algorithm 2 & 3 ---
             use_planar_dat=True,
             particle_collision_detection_interval=8,
-            # Extra mechanisms off for paper-only run
+            # --- Extra mechanisms: all OFF for paper-only run ---
             diagnostic_same_color_pairs=False,
             enable_watchlist=False,
             dynamic_recoloring=False,
             enable_same_color_barrier=False,
-            recovery_alpha=0.0,
+            recovery_alpha=0.0,   # locked-vertex recovery disabled
+            use_cuda_graph=True,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
+        # Create collision pipeline (default: unified)
         self.collision_pipeline = newton.examples.create_collision_pipeline(self.model, args)
         self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
 
-        # Top edge: +Y rotation; bottom corners: -Y rotation (opposite direction).
-        rot_point_indices = top_side + bottom_corners
-        rot_axes = [[0, 1, 0]] * len(top_side) + [[0, -1, 0]] * len(bottom_corners)
+        # All edges rotate around the same Z-axis. Top (Y>0) swings to -X, bottom (Y<0)
+        # swings to +X — opposite sides — creating the hourglass/bowtie cross-section.
+        rot_axes = [[0, 0, 1]] * len(top_side) + [[0, 0, -1]] * len(bottom_side)
 
         self.rot_point_indices = wp.array(rot_point_indices, dtype=int)
         self.t = wp.zeros((1,), dtype=float)
         self.rot_centers = wp.zeros(len(rot_point_indices), dtype=wp.vec3)
         self.rot_axes = wp.array(rot_axes, dtype=wp.vec3)
+
         self.roots = wp.zeros_like(self.rot_centers)
         self.roots_to_ps = wp.zeros_like(self.rot_centers)
 
@@ -244,50 +245,90 @@ class Example:
                 self.rot_axes,
                 self.t,
             ],
-            outputs=[self.roots, self.roots_to_ps],
+            outputs=[
+                self.roots,
+                self.roots_to_ps,
+            ],
         )
 
         self.viewer.set_model(self.model)
 
+        # put graph capture into it's own function
+        # self.simulate()
+        # self.capture()
+
+    def capture(self):
+        self.graph = None
+        if wp.get_device().is_cuda:
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
         self.solver.rebuild_bvh(self.state_0)
-
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
+
+            # apply forces to the model for picking, wind, etc
             self.viewer.apply_forces(self.state_0)
 
-            # Stop kinematic rotation once released.
-            if not self.released:
-                wp.launch(
-                    kernel=apply_top_rotation,
-                    dim=self.rot_point_indices.shape[0],
-                    inputs=[
-                        self.rot_point_indices,
-                        self.rot_axes,
-                        self.roots,
-                        self.roots_to_ps,
-                        self.t,
-                        self.rot_angular_velocity,
-                        self.sim_dt,
-                        self.rot_end_time,
-                    ],
-                    outputs=[
-                        self.state_0.particle_q,
-                        self.state_1.particle_q,
-                    ],
-                )
+            wp.launch(
+                kernel=apply_rotation,
+                dim=self.rot_point_indices.shape[0],
+                inputs=[
+                    self.rot_point_indices,
+                    self.rot_axes,
+                    self.roots,
+                    self.roots_to_ps,
+                    self.t,
+                    self.rot_angular_velocity,
+                    self.sim_dt,
+                    self.rot_end_time,
+                ],
+                outputs=[
+                    self.state_0.particle_q,
+                    self.state_1.particle_q,
+                ],
+            )
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+
+            # # Red dots: locked vertices (conservative_bound < 1e-4)
+            # fixed_counter = wp.zeros(1, dtype=int, device=wp.get_device())
+            # fixed_particle_positions = wp.empty(self.state_0.particle_count, dtype=wp.vec3, device=wp.get_device())
+            # wp.launch(
+            #     kernel=check_particle_valid,
+            #     dim=self.state_0.particle_count,
+            #     inputs=[
+            #         self.state_0.particle_q,
+            #         self.model.particle_inv_mass,
+            #         self.solver.particle_conservative_bounds,
+            #         1e-4,
+            #     ],
+            #     outputs=[fixed_counter, fixed_particle_positions],
+            # )
+            # fixed_num = fixed_counter.numpy()[0]
+            # debug_contact_points('/debug/fixed_points', self.viewer, fixed_particle_positions.numpy()[:fixed_num], (1, 0, 0), 0.01)
+
+            # Green dots: vertices where recovery gradient was applied this substep
+            if self.solver.recovery_alpha > 0.0:
+                recovered_num = int(self.solver._recovery_applied_count.numpy()[0])
+                recovered_num = min(recovered_num, self.solver.model.particle_count)
+                if recovered_num > 0:
+                    recovered_pos = self.solver._recovery_positions_buf.numpy()[:recovered_num]
+                    debug_contact_points('/debug/recovered_points', self.viewer, recovered_pos, (0, 1, 0), 0.01)
+
+            # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        # At rot_end_time release only the bottom corners; top stays fixed.
+        # Release both edges at end_time so the cloth untwists under physics.
         if not self.released and self.sim_time >= self.rot_end_time:
             self.released = True
             flags = self.model.particle_flags.numpy()
-            for idx in self.bottom_corners:
-                flags[idx] = flags[idx] | int(ParticleFlags.ACTIVE)
+            for idx in self.bottom_side:
+                flags[idx] |= int(ParticleFlags.ACTIVE)
             self.model.particle_flags = wp.array(flags, device=wp.get_device())
 
         self.simulate()
@@ -296,26 +337,37 @@ class Example:
     def render(self):
         if self.viewer is None:
             return
+
+        # Begin frame with time
         self.viewer.begin_frame(self.sim_time)
+
+        # Render model-driven content (ground plane)
         self.viewer.log_state(self.state_0)
         self.viewer.end_frame()
 
     def test_final(self):
-        # After 30 s (10 s twist + 20 s untwist) the cloth should still be
-        # within a loose bounding volume.
-        p_lower = wp.vec3(-0.6, -1.5, -0.6)
-        p_upper = wp.vec3(0.6, 0.6, 0.6)
+        p_lower = wp.vec3(-0.9, -0.9, -0.6)
+        p_upper = wp.vec3(0.9, 0.9, 0.6)
         newton.examples.test_particle_state(
             self.state_0,
             "particles are within a reasonable volume",
             lambda q, qd: newton.utils.vec_inside_limits(q, p_lower, p_upper),
         )
+        newton.examples.test_particle_state(
+            self.state_0,
+            "particle velocities are within a reasonable range",
+            lambda q, qd: max(abs(qd)) < 1.0,
+        )
 
 
 if __name__ == "__main__":
+    # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
-    parser.set_defaults(num_frames=1800)  # 30 s: 10 s twist + 20 s untwist
+    parser.set_defaults(num_frames=1800)  # 30 s: 10 s twist + 20 s free untwist
 
     viewer, args = newton.examples.init(parser)
+
+    # Create example and run
     example = Example(viewer, args)
+
     newton.examples.run(example, args)

@@ -231,8 +231,8 @@ def main():
                         help="VBD iteration counts to sweep (e.g. 10 50 100 500).")
     parser.add_argument("--dt", nargs="+", type=float, default=None,
                         help="Timestep values in seconds (e.g. 0.001 0.002).")
-    parser.add_argument("--substeps", type=int, default=10,
-                        help="Substeps per frame.")
+    parser.add_argument("--substeps", nargs="+", type=int, default=None,
+                        help="Substeps per frame — accepts multiple values for sweep (e.g. 2 5 10 20 40).")
     parser.add_argument("--log-iterations", action="store_true",
                         help="Enable per-iteration logging (very slow).")
     parser.add_argument("--device", default="cuda:0",
@@ -243,12 +243,14 @@ def main():
         scenes = ["no_contact_oscillation"]
         iter_counts = [10, 50]
         dt_values = [-1.0]
+        substep_values = [10]
         n_frames = 2
     else:
         scenes = args.scene or ["no_contact_oscillation", "frictionless_sliding",
                                  "separating_contact"]
         iter_counts = args.iterations or [10, 50, 100, 500]
         dt_values = args.dt or [-1.0]
+        substep_values = args.substeps or [10]
         n_frames = args.n_frames
 
     # Ablation matrix: [contact on/off, truncation on/off]
@@ -263,7 +265,7 @@ def main():
     meta_path = os.path.join(args.output_dir, "metadata.csv")
 
     fieldnames = [
-        "run_id", "scene", "iterations", "dt", "ablation",
+        "run_id", "scene", "iterations", "substeps", "dt", "ablation",
         "no_contact", "no_truncation", "no_friction",
         "status", "wall_time_s", "n_frames", "n_substeps",
         "ke_initial", "ke_final", "ke_ratio",
@@ -276,54 +278,60 @@ def main():
         writer.writeheader()
 
         run_id = 0
-        total = len(scenes) * len(iter_counts) * len(dt_values) * len(ablation_flags)
+        total = (len(scenes) * len(iter_counts) * len(dt_values)
+                 * len(substep_values) * len(ablation_flags))
         print(f"[ablation] {total} runs planned → {args.output_dir}")
 
         for scene in scenes:
             for n_iter in iter_counts:
                 for dt_val in dt_values:
-                    for abl_label, no_contact, no_trunc, no_fric in ablation_flags:
-                        run_label = (f"{scene}_iter{n_iter}_dt{dt_val:.4f}_{abl_label}"
-                                     .replace("-", "m"))
-                        diag_path = os.path.join(
-                            args.output_dir, run_label, "diagnostics.npz"
-                        )
-                        os.makedirs(os.path.dirname(diag_path), exist_ok=True)
+                    for n_sub in substep_values:
+                        for abl_label, no_contact, no_trunc, no_fric in ablation_flags:
+                            run_label = (
+                                f"{scene}_iter{n_iter}_sub{n_sub}_dt{dt_val:.4f}_{abl_label}"
+                                .replace("-", "m")
+                            )
+                            diag_path = os.path.join(
+                                args.output_dir, run_label, "diagnostics.npz"
+                            )
+                            os.makedirs(os.path.dirname(diag_path), exist_ok=True)
 
-                        run_args = _make_args(
-                            scene=scene,
-                            iterations=n_iter,
-                            dt=dt_val,
-                            substeps=args.substeps,
-                            no_contact=no_contact,
-                            no_truncation=no_trunc,
-                            no_friction=no_fric,
-                            diag_output_path=diag_path,
-                            diag_log_iterations=args.log_iterations,
-                            device=args.device,
-                        )
+                            run_args = _make_args(
+                                scene=scene,
+                                iterations=n_iter,
+                                dt=dt_val,
+                                substeps=n_sub,
+                                no_contact=no_contact,
+                                no_truncation=no_trunc,
+                                no_friction=no_fric,
+                                diag_output_path=diag_path,
+                                diag_log_iterations=args.log_iterations,
+                                device=args.device,
+                            )
 
-                        print(f"  [{run_id+1}/{total}] {run_label} … ", end="", flush=True)
-                        result = _run_one(run_args, n_frames=n_frames,
-                                         output_dir=args.output_dir)
-                        status = result.get("status", "?")
-                        print(f"{status}  ({result.get('wall_time_s', 0):.1f}s)")
+                            print(f"  [{run_id+1}/{total}] {run_label} … ",
+                                  end="", flush=True)
+                            result = _run_one(run_args, n_frames=n_frames,
+                                             output_dir=args.output_dir)
+                            status = result.get("status", "?")
+                            print(f"{status}  ({result.get('wall_time_s', 0):.1f}s)")
 
-                        row = {
-                            "run_id": run_id,
-                            "scene": scene,
-                            "iterations": n_iter,
-                            "dt": dt_val,
-                            "ablation": abl_label,
-                            "no_contact": no_contact,
-                            "no_truncation": no_trunc,
-                            "no_friction": no_fric,
-                            "diag_path": diag_path,
-                            **result,
-                        }
-                        writer.writerow(row)
-                        meta_f.flush()
-                        run_id += 1
+                            row = {
+                                "run_id": run_id,
+                                "scene": scene,
+                                "iterations": n_iter,
+                                "substeps": n_sub,
+                                "dt": dt_val,
+                                "ablation": abl_label,
+                                "no_contact": no_contact,
+                                "no_truncation": no_trunc,
+                                "no_friction": no_fric,
+                                "diag_path": diag_path,
+                                **result,
+                            }
+                            writer.writerow(row)
+                            meta_f.flush()
+                            run_id += 1
 
     print(f"\n[ablation] Done. Metadata → {meta_path}")
 

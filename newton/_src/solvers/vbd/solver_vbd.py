@@ -40,7 +40,9 @@ from .particle_vbd_kernels import (
     build_vertex_n_ring_tris_collision_filter,
     accumulate_same_color_watchlist_barrier_kernel,
     apply_locked_vertex_recovery_kernel,
-    apply_planar_dat_to_all_kernel,
+    apply_planar_truncation_parallel_by_collision,
+    apply_truncation_ts,
+    compute_displacement,
     build_same_color_watchlist_kernel,
     count_near_penetrations_kernel,
     compute_particle_conservative_bound,
@@ -191,6 +193,8 @@ class SolverVBD(SolverBase):
         recovery_log_path: str = "",
         use_planar_dat: bool = False,
         planar_dat_gamma_r: float = 0.9,
+        use_cuda_graph: bool = False,
+        diagnostics=None,
     ):
         """
         Args:
@@ -372,6 +376,14 @@ class SolverVBD(SolverBase):
         self.use_planar_dat = use_planar_dat
         self.planar_dat_gamma_r = planar_dat_gamma_r
 
+        # CUDA graph for particle solve iterations (one graph per dt value)
+        self.use_cuda_graph = use_cuda_graph
+        self._particle_solve_graph: "wp.Graph | None" = None
+        self._particle_solve_graph_dt: float = 0.0
+
+        # Diagnostics hook (VBDDiagnostics or None)
+        self._diag = diagnostics
+
         if enable_same_color_barrier and not particle_enable_self_contact:
             print(
                 "[barrier] WARNING: enable_same_color_barrier=True has no effect "
@@ -546,6 +558,10 @@ class SolverVBD(SolverBase):
                 [self.trimesh_collision_detector.collision_info], dtype=TriMeshCollisionInfo, device=self.device
             )
 
+            # Buffers for GitHub-style parallel-by-collision Planar-DAT
+            self.truncation_ts = wp.ones(model.particle_count, dtype=float, device=self.device)
+            self.particle_displacements = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+
             self.collision_evaluation_kernel_launch_size = max(
                 self.model.particle_count * NUM_THREADS_PER_COLLISION_PRIMITIVE,
                 self.model.edge_count * NUM_THREADS_PER_COLLISION_PRIMITIVE,
@@ -648,6 +664,16 @@ class SolverVBD(SolverBase):
             self._orig_particle_colors_np = model.particle_colors.numpy().copy()
             self._orig_particle_color_groups = [
                 g.numpy().copy() for g in model.particle_color_groups
+            ]
+            # Pre-allocate stable GPU arrays for CUDA-graph-safe restore.
+            # _restore_original_colors reuses these objects every substep so the CUDA graph's
+            # baked-in GPU pointers remain valid across substeps.
+            self._orig_particle_colors_gpu = wp.array(
+                self._orig_particle_colors_np, dtype=wp.int32, device=self.device
+            )
+            self._orig_particle_color_groups_gpu: list[wp.array] = [
+                wp.array(g, dtype=wp.int32, device=self.device)
+                for g in self._orig_particle_color_groups
             ]
             # Build mesh-edge neighbor adjacency for greedy recoloring.
             # edge_indices[:, 2] and [:, 3] are the two endpoint vertex indices.
@@ -1178,19 +1204,33 @@ class SolverVBD(SolverBase):
         # Use and reset the rigid history update flag (warmstarts).
         update_rigid_history = self.update_rigid_history
         self.update_rigid_history = True
-    
+
+        if self._diag is not None:
+            self._diag.on_before_prediction(state_in, self, dt)
+
         self.initialize_rigid_bodies(state_in, contacts, dt, update_rigid_history)
         self.initialize_particles(state_in, dt)
+
+        if self._diag is not None:
+            self._diag.on_after_prediction(state_in, self, dt)
 
         for iter_num in range(self.iterations):
             self.solve_rigid_body_iteration(state_in, state_out, contacts, dt)
             self.solve_particle_iteration(state_in, state_out, contacts, dt, iter_num, self.iterations-1)
+            if self._diag is not None and self._diag.log_iterations:
+                self._diag.on_after_solver_iteration(state_in, self, dt, iter_num)
+
+        if self._diag is not None:
+            self._diag.on_after_solver(state_in, self, dt)
 
         self.finalize_rigid_bodies(state_out, dt)
         self.finalize_particles(state_out, dt)
 
         if self.recovery_alpha > 0.0 and self.particle_enable_self_contact:
             self._apply_locked_vertex_recovery(state_out)
+
+        if self._diag is not None:
+            self._diag.on_end_of_step(state_out, self, dt)
 
     def initialize_particles(self, state_in: State, dt: float):
         """Initialize particle positions for the VBD iteration."""
@@ -1241,25 +1281,52 @@ class SolverVBD(SolverBase):
             # Algorithm 3, step 4: apply Planar-DAT to the initial inertia guess.
             # self.inertia holds the untruncated inertia positions (= X + ΔX_init).
             # state_in.particle_q is overwritten with the truncated result.
+            # GitHub 2-pass: parallel-by-collision truncation ratio computation.
+            if self._diag is not None:
+                self._diag.on_before_truncation(self.inertia, state_in, self)
             if self.use_planar_dat and self.particle_enable_self_contact:
+                # Pass 1a: displacement = inertia - X_0 (per vertex)
                 wp.launch(
-                    kernel=apply_planar_dat_to_all_kernel,
+                    kernel=compute_displacement,
+                    dim=model.particle_count,
+                    inputs=[self.inertia, self.pos_prev_collision_detection],
+                    outputs=[self.particle_displacements],
+                    device=self.device,
+                )
+                # Pass 1b: for each collision pair, compute division plane and
+                #          atomic-min each vertex's truncation ratio into truncation_ts.
+                self.truncation_ts.fill_(1.0)
+                wp.launch(
+                    kernel=apply_planar_truncation_parallel_by_collision,
+                    dim=self.collision_evaluation_kernel_launch_size,
+                    inputs=[
+                        self.pos_prev_collision_detection,
+                        self.particle_displacements,
+                        model.tri_indices,
+                        model.edge_indices,
+                        self.trimesh_collision_info,
+                        self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                        self.planar_dat_gamma_r,
+                        self.truncation_ts,
+                    ],
+                    device=self.device,
+                )
+                # Pass 2: apply per-vertex truncation ratio + isotropic displacement cap.
+                max_disp = 0.5 * self.planar_dat_gamma_r * 1.5 * self.particle_self_contact_radius
+                wp.launch(
+                    kernel=apply_truncation_ts,
                     dim=model.particle_count,
                     inputs=[
                         self.pos_prev_collision_detection,
-                        self.inertia,
-                        model.particle_flags,
-                        model.tri_indices,
-                        model.edge_indices,
-                        self.particle_adjacency,
-                        self.trimesh_collision_detector.collision_info,
-                        self.planar_dat_gamma_r,
-                        1.5 * self.particle_self_contact_radius,
-                        self.trimesh_collision_detector.edge_edge_parallel_epsilon,
+                        self.particle_displacements,
+                        self.truncation_ts,
+                        max_disp,
                     ],
                     outputs=[state_in.particle_q],
                     device=self.device,
                 )
+            if self._diag is not None:
+                self._diag.on_after_truncation(self.inertia, state_in, self)
         else:
             wp.launch(
                 kernel=forward_step,
@@ -1460,6 +1527,23 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
 
+    def _build_particle_solve_graph(
+        self, state_in: State, state_out: State, contacts: Contacts, dt: float
+    ) -> "wp.Graph":
+        """Capture one particle VBD iteration (kernel work only, no CD) as a reusable CUDA graph.
+
+        During capture ``wp.get_stream(self.device).is_capturing`` is ``True``, so
+        ``solve_particle_iteration`` automatically skips all CPU-side work (collision
+        detection, timing, logging) and records only the GPU kernel launches.
+        """
+        wp.capture_begin(device=self.device, force_module_load=True)
+        # iter_num=0 / max_iter_num=-1: collision-detection interval check fires for
+        # interval==0, but the is_capturing guard inside solve_particle_iteration
+        # skips it anyway.  Logging is off (data_collector.is_log_nothing()==True
+        # is a precondition enforced by the caller), so no .numpy() sync occurs.
+        self.solve_particle_iteration(state_in, state_out, contacts, dt, iter_num=0, max_iter_num=-1)
+        return wp.capture_end(device=self.device)
+
     def solve_particle_iteration(self, state_in: State, state_out: State, contacts: Contacts, dt: float, iter_num: int, max_iter_num=-1):
         """Solve one VBD iteration for particles."""
         model = self.model
@@ -1481,23 +1565,41 @@ class SolverVBD(SolverBase):
         if model.particle_count == 0:
             return
 
-        # Update collision detection if needed (penetration-free mode only)
-        if self.particle_enable_self_contact:
-            if (self.particle_collision_detection_interval == 0 and iter_num == 0) or (
-                self.particle_collision_detection_interval >= 1
-                and iter_num % self.particle_collision_detection_interval == 0
-            ):
-                if data_collector.is_log_nothing():
-                    self.collision_detection_penetration_free(state_in, iter_num)
-                else:
-                    col_detect_time_start = time.perf_counter()
-                    self.collision_detection_penetration_free_log_collision(state_in, iter_num)
-                    col_detect_time_end = time.perf_counter()
-                    data_collector.record_to_frame("col_detect_time", col_detect_time_end - col_detect_time_start)
+        # CD and timing: skip during CUDA graph capture (no CPU-GPU sync allowed)
+        if not wp.get_stream(self.device).is_capturing:
+            # Update collision detection if needed (penetration-free mode only)
+            if self.particle_enable_self_contact:
+                if (self.particle_collision_detection_interval == 0 and iter_num == 0) or (
+                    self.particle_collision_detection_interval >= 1
+                    and iter_num % self.particle_collision_detection_interval == 0
+                ):
+                    if data_collector.is_log_nothing():
+                        self.collision_detection_penetration_free(state_in, iter_num)
+                    else:
+                        col_detect_time_start = time.perf_counter()
+                        self.collision_detection_penetration_free_log_collision(state_in, iter_num)
+                        col_detect_time_end = time.perf_counter()
+                        data_collector.record_to_frame("col_detect_time", col_detect_time_end - col_detect_time_start)
+                elif not data_collector.is_log_nothing():
+                    data_collector.record_to_frame("col_detect_time", 0)
             elif not data_collector.is_log_nothing():
                 data_collector.record_to_frame("col_detect_time", 0)
-        elif not data_collector.is_log_nothing():
-            data_collector.record_to_frame("col_detect_time", 0)
+
+            # CUDA graph fast path: CD already done above; launch graph for kernel work.
+            # Disabled when per-iteration diagnostics are active (requires CPU sync each iter).
+            if (
+                self.use_cuda_graph
+                and data_collector.is_log_nothing()
+                and not self.enable_same_color_barrier
+                and (self._diag is None or not self._diag.log_iterations)
+            ):
+                if self._particle_solve_graph is None or dt != self._particle_solve_graph_dt:
+                    self._particle_solve_graph = self._build_particle_solve_graph(
+                        state_in, state_out, contacts, dt
+                    )
+                    self._particle_solve_graph_dt = dt
+                wp.capture_launch(self._particle_solve_graph)
+                return
 
         # Zero out forces and hessians
         self.particle_forces.zero_()
@@ -2477,13 +2579,19 @@ class SolverVBD(SolverBase):
     # ------------------------------------------------------------------
 
     def _restore_original_colors(self) -> None:
-        """Restore particle_colors and particle_color_groups to the saved static coloring."""
-        colors_np = self._orig_particle_colors_np.copy()
-        self.model.particle_colors = wp.array(colors_np, dtype=wp.int32, device=self.device)
-        self.model.particle_color_groups = [
-            wp.array(g, dtype=wp.int32, device=self.device)
-            for g in self._orig_particle_color_groups
-        ]
+        """Restore particle_colors and particle_color_groups to the saved static coloring.
+
+        Reuses pre-allocated GPU arrays (_orig_particle_colors_gpu /
+        _orig_particle_color_groups_gpu) so that the CUDA graph's baked-in GPU pointers
+        remain valid across substeps.  If the current color groups differ from the originals
+        (i.e. dynamic recoloring ran last substep), the CUDA graph is invalidated so it will
+        be rebuilt with the restored groups.
+        """
+        if self.model.particle_color_groups is not self._orig_particle_color_groups_gpu:
+            if self.use_cuda_graph:
+                self._particle_solve_graph = None
+        self.model.particle_colors = self._orig_particle_colors_gpu
+        self.model.particle_color_groups = self._orig_particle_color_groups_gpu
 
     def _apply_dynamic_recoloring(self, recolor_pairs_np: "np.ndarray") -> None:
         """Greedy CPU recoloring: reassign colors to separate same-color pairs in recolor region.
@@ -2533,6 +2641,10 @@ class SolverVBD(SolverBase):
             for g in color_groups
             if len(g) > 0
         ]
+        # Invalidate CUDA graph: the color-group GPU arrays just changed, so the graph's
+        # baked-in pointers are stale.  It will be rebuilt next solve_particle_iteration.
+        if self.use_cuda_graph:
+            self._particle_solve_graph = None
 
         print(f"[recolor] applied={n_applied} total_colors={num_colors}")
 

@@ -122,14 +122,20 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             self.iterations,
-            # particle_uvs=cloth_mesh.uvs,
             particle_enable_self_contact=True,
             particle_self_contact_radius=0.002,
-            particle_self_contact_margin=0.0035,
+            particle_self_contact_margin=0.003,
             ogc_contact=True,
-            coordinate_condensation=True
-            # use_al_contact=True,       # AL 활성화
-            # al_Gamma=0.9,              # 감쇠 계수 Γ
+            # --- Paper (arXiv:2604.15513) Algorithm 2 & 3 ---
+            use_planar_dat=True,
+            particle_collision_detection_interval=8,
+            # --- Extra mechanisms: all OFF for paper-only run ---
+            diagnostic_same_color_pairs=False,
+            enable_watchlist=False,
+            dynamic_recoloring=False,
+            enable_same_color_barrier=False,
+            recovery_alpha=0.0,   # locked-vertex recovery disabled
+            use_cuda_graph=True,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
