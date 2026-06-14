@@ -145,17 +145,19 @@ def _set_equal_axes(ax, pts: np.ndarray, pad: float = 0.1) -> None:
     ax.set_box_aspect((1, 1, 1))
 
 
-def _add_mesh(ax, q: np.ndarray, tris: np.ndarray, facecolor: str) -> None:
+def _add_mesh(ax, q: np.ndarray, tris: np.ndarray, facecolor: str, alpha: float = 0.95,
+              edgecolor: str = "k") -> None:
     if len(tris) == 0:
         return
     verts = q[tris]
-    poly = Poly3DCollection(verts, facecolor=facecolor, edgecolor="k", linewidths=0.1, alpha=0.95)
+    poly = Poly3DCollection(verts, facecolor=facecolor, edgecolor=edgecolor, linewidths=0.1, alpha=alpha)
     ax.add_collection3d(poly)
 
 
 def _render_scene(out_name: str, title: str, frames: dict, tri_indices: np.ndarray,
                    labels: dict, camera: tuple[float, float],
-                   layer_masks: tuple[np.ndarray, np.ndarray] | None = None) -> None:
+                   layer_masks: tuple[np.ndarray, np.ndarray] | None = None,
+                   bottom_alpha: float = 0.95, bottom_edgecolor: str = "k") -> None:
     all_pts = np.concatenate(list(frames.values()), axis=0)
     frame_nums = sorted(frames.keys())
 
@@ -167,7 +169,8 @@ def _render_scene(out_name: str, title: str, frames: dict, tri_indices: np.ndarr
             _add_mesh(ax, q, tri_indices, facecolor="lightsteelblue")
         else:
             mask_top, mask_bottom = layer_masks
-            _add_mesh(ax, q, tri_indices[mask_bottom], facecolor="salmon")
+            _add_mesh(ax, q, tri_indices[mask_bottom], facecolor="salmon",
+                      alpha=bottom_alpha, edgecolor=bottom_edgecolor)
             _add_mesh(ax, q, tri_indices[mask_top], facecolor="lightsteelblue")
         _set_equal_axes(ax, all_pts)
         ax.view_init(elev=camera[0], azim=camera[1])
@@ -224,6 +227,8 @@ def main() -> None:
         labels={0: "t=0.00s (initial)", 15: "t=0.25s", 29: "t=0.48s (final)"},
         camera=CAMERA["B"],
         layer_masks=(mask_top, mask_bottom),
+        bottom_alpha=0.15,
+        bottom_edgecolor="darkred",
     )
 
     # --- Scene C: separating_contact (30 frames = 0.5s) ---
