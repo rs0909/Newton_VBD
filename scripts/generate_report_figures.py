@@ -144,6 +144,29 @@ def fig03_sceneB_energy_by_ablation() -> None:
     _savefig(fig, "fig03_sceneB_energy_by_ablation.png")
 
 
+def fig13_sceneB_energy_by_iter() -> None:
+    """Total energy vs time for Scene B, full variant, across iteration counts.
+
+    Supports report §4.2/§4.3 clarification: the per-substep Planar-DAT
+    truncation rate increases monotonically with iteration count (table in
+    §4.2), but the final total energy does not track it monotonically for
+    iter>=50 -- truncation's net contribution (full - no_trunc, §7.2) is a
+    small, non-monotonic correction on top of the dominant sustained-contact
+    / structural damping loss.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for it in (10, 50, 100, 500):
+        npz = _load(f"ablation_sceneB/frictionless_sliding_iter{it}_dtm1.0000_full")
+        ax.plot(_time(npz), npz["end_of_step/total_energy"], label=f"iter={it}",
+                color=ITER_COLORS[it], alpha=0.8)
+    ax.set_xlabel("simulated time (s)")
+    ax.set_ylabel("total energy (J)")
+    ax.set_title("Scene B — Total Energy vs Time (full, varying iterations)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    _savefig(fig, "fig13_sceneB_energy_by_iter.png")
+
+
 def fig04_sceneB_truncation_vs_iter() -> None:
     """Planar-DAT truncation fraction and tangential fraction vs time, Scene B (full).
 
@@ -397,6 +420,7 @@ def main() -> None:
         fig02_sceneA_energy_components,
         fig03_sceneB_energy_by_ablation,
         fig04_sceneB_truncation_vs_iter,
+        fig13_sceneB_energy_by_iter,
         fig05_sceneC_energy_by_iter,
         fig06_sceneC_iter10_stability,
         fig07_sceneD_energy_timeline,
