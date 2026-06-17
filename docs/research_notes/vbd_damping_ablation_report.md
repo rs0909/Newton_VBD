@@ -122,9 +122,22 @@ For each scene × iteration count, four variants were run:
 | 100 | 118.3 | 9.5%  | −1.414 J | −1.247 J | 0.420 | 0.126 |
 | 500 | 127.6 | 10.2% | −1.781 J | −1.584 J | 0.413 | 0.112 |
 
+#### Total energy vs. iteration count
+
+The table above shows the per-substep Planar-DAT truncation rate increasing monotonically with iteration count. The natural follow-up question is whether this translates into a monotonically lower *final* total energy:
+
+| iter | E_initial (J) | E_final (J, t=0.5s) | ΔE = E_initial − E_final (J) |
+|------|--------------|---------------------|-------------------------------|
+| 10  | 11.34 | −49.49 | 60.83 |
+| 50  | 18.65 | −67.81 | 86.45 |
+| 100 | 19.06 | −65.83 | 84.89 |
+| 500 | 19.66 | −64.43 | 84.09 |
+
+iter=50/100/500 start near +19–20J and track closely until t≈0.1s; iter=10 starts measurably lower (≈11J) after a brief transient in t<0.02s, reflecting under-converged contact resolution during the layers' initial settling. From t≈0.15s the iter=10 trajectory separates from the other three, plateauing near −49J by t≈0.3s and remaining essentially flat (±1J ringing) through t=0.5s — a qualitatively different, higher-energy final state than iter≥50. The iter=50/100/500 trajectories remain close together throughout and are still decreasing gently at t=0.5s, ending at −67.8J, −65.8J, and −64.4J respectively — i.e., *less* loss at iter=500 (84.1J) than at iter=50 (86.5J), the opposite of a simple "more iterations → more loss" trend. This ≈4J spread among iter≥50 is the same order of magnitude as the ±5J `full − no_trunc` isolation values in §7.2, indicating that Planar-DAT truncation's *net* effect on final total energy is a small, non-monotonic correction layered on top of a dominant ≈85J loss common to all iter≥50 runs — the per-substep truncation-rate increase shown in the table above does not translate into a correspondingly larger total-energy deficit.
+
 ### 4.3 Findings
 
-1. **More iterations → more truncation → more energy loss.** With 500 iterations, Planar-DAT removes 1.78 J of KE per substep, vs. only 0.27 J at 10 iterations.
+1. **More iterations → more truncation per substep, but not more total energy loss.** With 500 iterations, Planar-DAT removes 1.78 J of KE per substep, vs. only 0.27 J at 10 iterations (table above). However, the *final* total energy is not monotonic in iteration count (see "Total energy vs. iteration count" above): the large iter=10→50 jump (60.8J→86.5J loss) reflects a convergence-quality transition, while iter=50/100/500 differ by only ≈4J, with iter=500 showing the *least* loss of the three.
 2. **Tangential fraction ≈ 0.42 (constant)**. Even with μ=0 (no friction force), 42% of removed displacement is tangential to the contact normal. Planar-DAT acts as an implicit friction-like damper in the sliding direction.
 3. **`delta_linear_momentum_z > 0`**: Truncation injects upward normal-direction momentum (cloth pushed away from surface), while removing KE overall — a non-conservative impulse.
 4. The `no_contact` variant shows extreme KE (356 J at t=0.5 s) from free fall, confirming that contact constraints are essential to limit cloth motion.
