@@ -174,12 +174,12 @@ The table above shows the per-substep Planar-DAT truncation rate increasing mono
 
 ### 4.3 Findings
 
-1. **More iterations → more truncation per substep, but not more total energy loss.** With 500 iterations, Planar-DAT removes 1.78 J of KE per substep, vs. only 0.27 J at 10 iterations (Figure 6). However, the *final* total energy is not monotonic in iteration count (Figure 17): the large iter=10→50 jump (60.8J→86.5J loss) reflects a convergence-quality transition, while iter=50/100/500 differ by only ≈4J, with iter=500 showing the *least* loss of the three.
+1. **More iterations → more truncation per substep, but not more total energy loss.** With 500 iterations, Planar-DAT removes 1.78 J of KE per substep, vs. only 0.27 J at 10 iterations (Figure 6). However, the *final* total energy is not monotonic in iteration count (Figure 17): the large iter=10→50 jump (60.8J→86.5J loss) reflects a convergence-quality transition, while iter=50/100/500 differ by only ≈4J, with iter=500 showing the *least* loss of the three. The Planar-DAT-exclusive contribution (full−no_trunc ≈ +3.3 J at iter=100, i.e., truncation *reduced* dissipation relative to no-truncation) is less than 4% of the ≈85 J total dissipation, confirming that **the dominant damping source is structural backward-Euler implicit integration, not Planar-DAT truncation**.
 2. **Tangential fraction ≈ 0.42 (constant)**. Even with μ=0 (no friction force), 42% of removed displacement is tangential to the contact normal. Planar-DAT acts as an implicit friction-like damper in the sliding direction.
 3. **`delta_linear_momentum_z > 0`**: Truncation injects upward normal-direction momentum (cloth pushed away from surface), while removing KE overall — a non-conservative impulse.
 4. The `no_contact` variant shows extreme KE (356 J at t=0.5 s) from free fall, confirming that contact constraints are essential to limit cloth motion.
 
-**Conclusion**: In sustained-contact scenarios, **Planar-DAT truncation is the primary energy dissipation mechanism beyond structural implicit damping**, and its magnitude scales with iteration count.
+**Conclusion**: In sustained-contact scenarios, per-substep ΔKE_trunc scales with iteration count (0.27 J/sub at iter=10 → 1.78 J/sub at iter=500). However, this does **not** translate into more total energy loss: the full−no_trunc final-energy difference is ≈3 J (non-monotonic, sometimes negative) versus ≈85 J total dissipation. The dominant dissipation source is **structural backward-Euler implicit damping**, present equally in all variants. Planar-DAT's measurable role is displacement limiting and stability (§5.3), not energy dissipation.
 
 ---
 
@@ -345,9 +345,9 @@ This means ~42% of the displacement removed by Planar-DAT is perpendicular to th
                     (implicit int.) (truncation)     (iter too low)
 ────────────────────────────────────────────────────────────────────────
 Scene A (no contact)    ████████████      —               —
-Scene B (sliding)       ██              ████████████    ███
+Scene B (sliding)       ████████████    ██ (non-mono.)  ███
 Scene C (separating)    ███             ███ (stabilize) ████████ (iter<50)
-Scene D (twisted)       ██              ████ (complex)  ████████
+Scene D (twisted)       ██              ████ (path-dep.)████████
 ```
 
 ### 7.5 Effect of Substep Count (Timestep Size)
@@ -410,9 +410,11 @@ Scene A demonstrates that even at iter=500 (fully converged), a 24×24 cloth los
 - Higher-order time integration (e.g., BDF2, midpoint rule)
 - Kinetic energy injection / velocity correction step
 
-### 8.2 Planar-DAT Truncation Creates Iteration-Dependent Damping
+### 8.2 Planar-DAT Truncation: Iteration-Dependent Per-Substep Clipping, Not Net Damping
 
-In sustained-contact scenarios (Scene B), more iterations → more particle displacement → larger truncation → more KE removed. This creates an unfortunate trade-off: better convergence induces more contact damping.
+In sustained-contact scenarios (Scene B), more iterations produce larger per-substep particle displacements, increasing both n_truncated and ΔKE_trunc per substep (0.27 J → 1.78 J, iter=10→500). However, this does **not** translate into monotonically more total energy loss. The full−no_trunc isolation shows the net Planar-DAT contribution is ≈3 J (non-monotonic: −0.8 J at iter=50, +3.3 J at iter=100, −3.6 J at iter=500) against ≈85 J total dissipation. The dominant damping is structural backward-Euler, equally present in all variants.
+
+What does change with more iterations is the cloth's **convergence path**: higher per-substep clipping shifts the VBD starting point, which can lead the solver to a different equilibrium. This path-dependence accumulates over many substeps — visible in Scene D, where the full−no_trunc spread reaches ±27 J over 720 frames despite per-substep ΔKE_trunc being only ≈10⁻⁵ J.
 
 The tangential component (42%) of truncation cannot be disabled by setting μ=0. Reducing tangential truncation requires either:
 - Projecting the truncation scale to be applied only in the normal direction
